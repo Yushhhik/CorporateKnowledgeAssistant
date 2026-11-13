@@ -1,0 +1,5 @@
+.env
+hf_cache/
+__pycache__/
+*.pyc
+.idea/
