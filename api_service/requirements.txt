@@ -8,3 +8,5 @@ pdfplumber
 sentence-transformers
 openai
 python-docx
+pytest
+httpx
