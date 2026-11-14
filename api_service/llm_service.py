@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from prompts import build_prompt
 load_dotenv()
 OLLAMA_BASE_URL=os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llava")
 LLM_TIMEOUT = 30
 async def _call_ollama(messages: list) -> str:
     async with httpx.AsyncClient(timeout=30) as client:
