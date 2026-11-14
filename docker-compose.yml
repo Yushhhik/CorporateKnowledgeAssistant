@@ -34,7 +34,7 @@ services:
       redis:
         condition: service_healthy
       qdrant:
-        condition: service_started
+        condition: service_healthy  # <--- ВЕРНУЛИ service_healthy (чтобы app не стартовал, пока Qdrant не готов)
     environment:
       - HF_HOME=/app/hf_cache
       - HF_ENDPOINT=https://hf-mirror.com
@@ -62,7 +62,7 @@ services:
     environment:
       - PROXY_URL=socks5://host.docker.internal:10808
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - "host.docker.internal:gost-gateway"
 
 volumes:
   qdrant_data:
