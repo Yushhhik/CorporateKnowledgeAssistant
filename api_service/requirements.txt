@@ -2,6 +2,9 @@ fastapi
 uvicorn
 pydantic
 redis
-qdrant-client[fastembed]
+qdrant-client
 requests[socks]
-pypdf
+pdfplumber
+sentence-transformers
+openai
+python-docx
