@@ -1,62 +1,140 @@
-"""Поиск по базе знаний. Эту функцию вызывает интегратор в основном пайплайне.
+"""Поиск по базе знаний."""
 
-Пример:
-    from search import search, search_async, is_confident, format_source
-    hits = await search_async("Как сбросить пароль?")
-    if is_confident(hits):
-        ...   # собираем промпт из hits, источник берём через format_source(hit)
-
-Если hit["type"] == "image", у него есть hit["image_path"]: файл можно отправить
-пользователю в Telegram (send_photo), это хорошо для вопросов "как выглядит кнопка".
-
-Ручная проверка:
-    python search.py "Мне не отвечает офис-менеджер"
-"""
 import asyncio
+import logging
+import re
 import sys
 from pathlib import Path
 
 from qdrant_client.models import FieldCondition, Filter, MatchValue
 
-from qdrant_store import COLLECTION_NAME, embed_query, get_client
+from qdrant_store import (
+    COLLECTION_NAME,
+    embed_query,
+    get_client,
+    get_neighbors,
+    get_page_images,
+    warm_up,
+)
+
+log = logging.getLogger("rag.search")
 
 TOP_K = 5
-# Порог уверенности: если лучший результат ниже, бот должен сказать
-# "Я не нашел точного ответа. Переключить на оператора?".
-# Подбирается на тест-кейсах (python test_search.py подскажет значение).
-CONFIDENCE_THRESHOLD = 0.80
+CONFIDENCE_THRESHOLD = 0.8359
+CONTEXT_CHUNKS = 3
+
+CANDIDATES = 15
+LEXICAL_WEIGHT = 0.05
+MAX_CONTEXT_CHARS = 3500
 
 _client = None
 
 
 def _get_client():
     global _client
+
     if _client is None:
         _client = get_client()
+
     return _client
 
 
-def search(query: str, top_k: int = TOP_K, chunk_type: str | None = None) -> list[dict]:
-    """Топ-k ближайших чанков, лучшие первыми.
+def warm() -> None:
+    warm_up()
+    _get_client().get_collections()
 
-    chunk_type: None (и текст, и картинки), "text" или "image".
-    Каждый результат: {type, source, section, page, text, image_path, score}.
-    """
+
+def detect_system(query: str) -> str | None:
+    query = (query or "").lower()
+
+    if "sap" in query:
+        return "sap"
+
+    if re.search(r"(?<![а-яa-z0-9])(1с|1c)(?![а-яa-z0-9])", query):
+        return "1c"
+
+    if "docsvision" in query or "доксвиж" in query or "докс вижн" in query:
+        return "docsvision"
+
+    if (
+        "garantexpress" in query
+        or "гарант экспресс" in query
+        or "гарантэкспресс" in query
+        or "экспресс согласован" in query
+    ):
+        return "garantexpress"
+
+    if "барс" in query or "bars" in query:
+        return "bars"
+
+    return None
+
+
+_WORD_RE = re.compile(r"[a-zа-яё0-9]+", re.IGNORECASE)
+
+
+def _stem(word: str) -> str:
+    return word[:5] if len(word) > 5 else word
+
+
+def _words(text: str) -> set[str]:
+    return {_stem(w) for w in _WORD_RE.findall(text.lower()) if len(w) > 3}
+
+
+def _lexical_bonus(query_words: set[str], text: str) -> float:
+    if not query_words:
+        return 0.0
+
+    return LEXICAL_WEIGHT * len(query_words & _words(text)) / len(query_words)
+
+
+def search(
+    query: str,
+    top_k: int = TOP_K,
+    chunk_type: str | None = None,
+    system: str | None = None
+) -> list[dict]:
     query = (query or "").strip()
+
     if not query:
         return []
 
-    flt = None
+    if system is None:
+        system = detect_system(query)
+
+    conditions = []
+
     if chunk_type:
-        flt = Filter(must=[FieldCondition(key="type", match=MatchValue(value=chunk_type))])
+        conditions.append(
+            FieldCondition(key="type", match=MatchValue(value=chunk_type))
+        )
+
+    if system:
+        conditions.append(
+            FieldCondition(key="system", match=MatchValue(value=system))
+        )
+
+    flt = Filter(must=conditions) if conditions else None
 
     response = _get_client().query_points(
         collection_name=COLLECTION_NAME,
         query=embed_query(query),
         query_filter=flt,
-        limit=top_k,
+        limit=max(top_k, CANDIDATES),
         with_payload=True,
     )
+
+    qwords = _words(query)
+
+    ranked = sorted(
+        response.points,
+        key=lambda p: p.score + _lexical_bonus(
+            qwords,
+            f"{p.payload.get('section') or ''} {p.payload['text']}"
+        ),
+        reverse=True,
+    )[:top_k]
+
     return [
         {
             "type": p.payload.get("type", "text"),
@@ -65,70 +143,153 @@ def search(query: str, top_k: int = TOP_K, chunk_type: str | None = None) -> lis
             "page": p.payload.get("page"),
             "text": p.payload["text"],
             "image_path": p.payload.get("image_path"),
+            "system": p.payload.get("system", "unknown"),
+            "chunk_index": p.payload.get("chunk_index"),
             "score": round(p.score, 4),
         }
-        for p in response.points
+        for p in ranked
     ]
 
 
-async def search_async(query: str, top_k: int = TOP_K, chunk_type: str | None = None) -> list[dict]:
-    """Та же функция, но не блокирует event loop (эмбеддинг считается в отдельном потоке)."""
-    return await asyncio.to_thread(search, query, top_k, chunk_type)
+async def search_async(
+    query: str,
+    top_k: int = TOP_K,
+    chunk_type: str | None = None,
+    system: str | None = None
+) -> list[dict]:
+    return await asyncio.to_thread(search, query, top_k, chunk_type, system)
 
 
-def is_confident(hits: list[dict], threshold: float = CONFIDENCE_THRESHOLD) -> bool:
-    """True, если лучший результат достаточно близок к вопросу, чтобы отвечать по нему."""
-    return bool(hits) and hits[0]["score"] >= threshold
+def is_confident(
+    hits: list[dict],
+    threshold: float | None = None
+) -> bool:
+    if threshold is None:
+        threshold = CONFIDENCE_THRESHOLD
+
+    return bool(hits) and max(h["score"] for h in hits) >= threshold
 
 
 def format_source(hit: dict) -> str:
-    """Строка для ответа бота: 'Источник: БП Командировка, раздел «5 Инструкция»' или '..., стр. 9'."""
     name = Path(hit["source"]).stem
+
     if hit.get("page"):
         return f"Источник: {name}, стр. {hit['page']}"
-    return f"Источник: {name}, раздел «{hit['section']}»"
+
+    return f"Источник: {name}, раздел «{hit.get('section')}»"
 
 
-CONTEXT_CHUNKS = 3  # сколько лучших чанков склеиваем в контекст для LLM
+def _expand(best: dict) -> str:
+    parts = [best["text"]]
+
+    if best.get("chunk_index") is None or best["type"] != "text":
+        return best["text"]
+
+    try:
+        neighbors = get_neighbors(
+            _get_client(), best["source"], best["chunk_index"]
+        )
+    except Exception:
+        log.exception("neighbors failed")
+        return best["text"]
+
+    for n in neighbors:
+        if n.get("type") != "text" or n.get("section") != best.get("section"):
+            continue
+
+        if n.get("chunk_index", 0) < best["chunk_index"]:
+            parts.insert(0, n["text"])
+        else:
+            parts.append(n["text"])
+
+    return "\n".join(parts)
 
 
-async def search_qdrant(query: str) -> tuple[str | None, dict | None]:
-    """Интерфейс для интегратора (контракт с Core).
+def _collect_images(best: dict, good: list[dict]) -> list[str]:
+    paths = [h["image_path"] for h in good if h.get("image_path")]
 
-    Использование: context, payload = await search_qdrant(msg.text)
+    if best.get("page") is not None:
+        try:
+            for p in get_page_images(_get_client(), best["source"], best["page"]):
+                if p.get("image_path"):
+                    paths.append(p["image_path"])
+        except Exception:
+            log.exception("page images failed")
 
-    Возвращает (контекст, метаданные) или (None, None), если ответа нет / уверенность низкая.
-      контекст: текст лучших фрагментов (те из топ-3, что выше порога), для промпта LLM;
-      метаданные: {"source": имя файла, "page": номер страницы (у docx вместо номера
-                   название раздела), "score": ..., "section", "citation",
-                   "image_path", "sources"}.
-    """
-    hits = await search_async(query, top_k=TOP_K)
+    return list(dict.fromkeys(paths))[:5]
+
+
+def _search_qdrant_sync(query: str) -> tuple[str | None, dict | None]:
+    hits = search(query, top_k=TOP_K)
+
     if not is_confident(hits):
         return None, None
 
-    good = [h for h in hits[:CONTEXT_CHUNKS] if h["score"] >= CONFIDENCE_THRESHOLD]
-    context = "\n\n".join(f"[{format_source(h)}]\n{h['text']}" for h in good)
+    good = [
+        h for h in hits
+        if h["score"] >= CONFIDENCE_THRESHOLD
+    ][:CONTEXT_CHUNKS]
 
-    best = hits[0]
+    if not good:
+        return None, None
+
+    best = good[0]
+
+    blocks = []
+
+    for i, h in enumerate(good):
+        text = _expand(h) if i == 0 else h["text"]
+        blocks.append(f"[{format_source(h)}]\n{text}")
+
+    context = "\n\n".join(blocks)[:MAX_CONTEXT_CHARS]
+
     payload = {
         "source": best["source"],
-        # у docx нет страниц, поэтому вместо номера отдаём раздел: ключ page есть всегда
-        "page": best["page"] if best["page"] is not None else best["section"],
+        "page": (
+            best["page"]
+            if best["page"] is not None
+            else best["section"]
+        ),
         "score": best["score"],
         "section": best["section"],
-        "citation": format_source(best),    # готовая строка "Источник: ..."
-        "image_path": best["image_path"],   # путь к картинке, если лучший результат это скриншот
+        "citation": format_source(best),
+        "image_path": best["image_path"],
+        "images": _collect_images(best, good),
+        "system": best["system"],
         "sources": list(dict.fromkeys(format_source(h) for h in good)),
     }
+
     return context, payload
+
+
+async def search_qdrant(
+    query: str,
+    raise_errors: bool = False
+) -> tuple[str | None, dict | None]:
+    try:
+        return await asyncio.to_thread(_search_qdrant_sync, query)
+    except Exception:
+        log.exception("search_qdrant failed")
+
+        if raise_errors:
+            raise
+
+        return None, None
 
 
 if __name__ == "__main__":
     q = " ".join(sys.argv[1:]) or "Как сбросить пароль?"
+
     results = search(q)
+
     print(f"Вопрос: {q}")
+    print(f"Определённая система: {detect_system(q)}")
     print(f"Уверенность: {is_confident(results)}\n")
+
     for i, h in enumerate(results, 1):
-        print(f"{i}. [{h['score']}] ({h['type']}) {format_source(h)}")
+        print(
+            f"{i}. [{h['score']}] "
+            f"({h['type']}, {h['system']}) "
+            f"{format_source(h)}"
+        )
         print(f"   {h['text'][:200]}\n")

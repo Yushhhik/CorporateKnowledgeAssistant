@@ -1,188 +1,63 @@
-import os
 import asyncio
-import httpx
-from dotenv import load_dotenv
-from prompts import build_prompt
-load_dotenv()
-OLLAMA_BASE_URL=os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llava")
-LLM_TIMEOUT = 30
-async def _call_ollama(messages: list) -> str:
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            f"{OLLAMA_BASE_URL}/api/chat",
-            json={
-                "model": OLLAMA_MODEL,
-                "messages": messages,
-                "stream": False,
-                "options": {
-                    "temperature": 0.2,
-                    "num_predict": 600
-                }
-            }
+import os
+import re
+import openai
+from prompts import NO_ANSWER, build_prompt
+
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://sprashivaem_u_natashi:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "sprashivaem_u_natashi")
+LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "120"))
+
+_client: openai.OpenAI | None = None
+
+_SOURCE_LINE_RE = re.compile(r"(?im)^\s*источник(?:и)?\s*:.*$")
+_REFUSAL_RE = re.compile(r"не нашел точного ответа", re.IGNORECASE)
+
+
+class LLMError(Exception):
+    pass
+
+
+def _get_client() -> openai.OpenAI:
+    global _client
+    if _client is None:
+        _client = openai.OpenAI(
+            base_url=f"{OLLAMA_BASE_URL}/v1",
+            api_key="ollama",
+            timeout=LLM_TIMEOUT,
+            max_retries=0,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["message"]["content"]
+    return _client
 
-async def ask_llm(context: str, history: list, question: str) -> str:
 
+def clean_answer(text: str | None) -> str:
+    text = (text or "").strip()
+    if not text or _REFUSAL_RE.search(text):
+        return NO_ANSWER
+    text = _SOURCE_LINE_RE.sub("", text).strip()
+    return text or NO_ANSWER
+
+
+async def ask_llm(context: str, history: list, question: str, image_base64: str | None = None) -> str:
     messages = build_prompt(context, history, question)
+
+    if image_base64:
+        for msg in reversed(messages):
+            if msg["role"] == "user":
+                msg["content"] = [
+                    {"type": "text", "text": msg["content"]},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
+                ]
+                break
+
     try:
-        answer = await asyncio.wait_for(_call_ollama(messages), timeout=LLM_TIMEOUT)
-        return answer
-    except asyncio.TimeoutError:
-        print("[llm_service] Таймаут Ollama, отдаю заготовленный ответ")
-        return await _stub_answer(context, question)
-    except httpx.ConnectError:
-        print("[llm_service] Ollama недоступна (не запущена)")
-        return (
-            "К сожалению, ИИ-ассистент сейчас недоступен. "
-            "Попробуйте повторить запрос чуть позже "
-            "или напишите «оператор», чтобы связаться с живой поддержкой."
+        response = await asyncio.to_thread(
+            _get_client().chat.completions.create,
+            model=OLLAMA_MODEL,
+            messages=messages,
+            temperature=0.1,
+            max_tokens=500,
         )
     except Exception as e:
-        print(f"[llm_service] Ошибка Ollama: {e}")
-        return (
-            "К сожалению, ИИ-ассистент сейчас недоступен. "
-            "Попробуйте повторить запрос чуть позже "
-            "или напишите «оператор», чтобы связаться с живой поддержкой."
-        )
-
-async def _stub_answer(context: str, question: str) -> str:
-    await asyncio.sleep(0.1)
-    q = question.lower()
-    if not context or context.strip() == "" or "борщ" in q or "рецепт" in q:
-        return "Я не нашел точного ответа в документации. Переключить на оператора?"
-
-    if "техник" in q and ("добавить" in q or "статус" in q or "запис" in q):
-        return (
-            "В документации описан только реестр мебели, реестра техники нет. "
-            "Возможно, вы имели в виду реестр мебели?\n\n"
-            "Если да, то для добавления записи нужно:\n"
-            "1. Нажать кнопку 'Добавить'\n"
-            "2. Заполнить поля (Модель, Подразделение, Кабинет, Инвентарный номер)\n"
-            "3. Нажать 'Сохранить'\n\n"
-            "Источник: Реестр мебели.pdf, стр. 9"
-        )
-
-    if "календар" in q or "интерфейс" in q:
-        return (
-            "Интерфейс БАРС-Офиса состоит из главного меню в левой части верхней панели. "
-            "Производственный календарь с возможностью переключения между РФ и РТ находится "
-            "в нижней части интерфейса главного меню. При нажатии на кнопку 'Подробный календарь' "
-            "откроется полный календарь в отдельном окне.\n\n"
-            "Источник: Функциональные возможности работы с БАРС-Офисом.pdf, стр. 4, 6"
-        )
-
-    if "фильтр" in q and ("настро" in q or "шаг" in q or "действ" in q):
-        return (
-            "Пошаговая инструкция по настройке фильтра:\n"
-            "1. Нажмите на изображение лупы в строке фильтра (на нижней панели БО).\n"
-            "2. Задайте условия (можно группировать по 'и', 'или').\n"
-            "3. Нажмите кнопку 'Применить'.\n\n"
-            "Источник: Функциональные возможности работы с БАРС-Офисом.pdf, стр. 8-9"
-        )
-
-    if "!>" in q or ("200" in q and "фильтр" in q):
-        return (
-            "Синтаксис '!>' не является корректным оператором фильтрации. "
-            "Доступные операторы: '>', '<', '=', '!=' (не равно).\n"
-            "Правильный синтаксис: '> 200' или '!= 200'.\n\n"
-            "Источник: Функциональные возможности работы с БАРС-Офисом.pdf, стр. 9-10"
-        )
-
-    if "bo.bars.group" in q or "ссылк" in q:
-        return (
-            "Ссылка вида bo.bars.group — это прямая ссылка на документ в БАРС-Офис "
-            "с уже применённым фильтром. Просто перейдите по ней, и документ откроется "
-            "с нужными настройками отображения.\n\n"
-            "Источник: Функциональные возможности работы с БАРС-Офисом.pdf, стр. 24"
-        )
-
-    if "согласовыва" in q and "командировк" in q:
-        return (
-            "После нажатия кнопки 'На согласование' бизнес-процесс назначается "
-            "на руководителя выбранного подразделения.\n\n"
-            "Источник: БП Командировка.pdf, стр. 9"
-        )
-
-    if "график" in q or "офис-менеджер" in q or "не отвечает" in q:
-        return (
-            "График дежурства офис-менеджеров:\n"
-            "• Понедельник – Пятница: с 17:30 до 21:00\n"
-            "• Суббота – Воскресенье: с 10:30 до 21:00\n"
-            "Дежурный офис-менеджер доступен по телефону: +79991002030.\n\n"
-            "Источник: БП Командировка.pdf, стр. 3"
-        )
-
-    if "пресейл" in q or "30%" in q or "воронк" in q:
-        return (
-            "Сделка не отображается, потому что для Бизнес-центров действуют фильтры:\n"
-            "• процент статуса в воронке >= 60%\n"
-            "• указана дата начала работ\n"
-            "• есть бюджет на текущий год\n\n"
-            "Источник: БП Командировка.pdf, стр. 7"
-        )
-
-    if "бюджет" in q and ("не заложил" in q or "средств" in q):
-        return (
-            "Нет, запустить не получится. Если остаток по билетам меньше 1000 руб. "
-            "или остаток по командировочным меньше запрашиваемой суммы, процесс "
-            "останавливается и возвращается автору для корректировки бюджета.\n\n"
-            "Источник: БП Командировка.pdf, стр. 9-10"
-        )
-
-    if "услов" in q and "согласующ" in q:
-        return (
-            "Согласующим лицом выступает руководитель выбранного подразделения. "
-            "Для руководителей отделов и директоров БЦ предусмотрены уведомления "
-            "в боте 'Бот БАРС-Офис' с возможностью согласовать/отклонить.\n\n"
-            "Источник: БП Командировка.pdf, стр. 9, 15"
-        )
-
-    if "кнопк" in q and "мебел" in q:
-        return (
-            "В реестре мебели доступны кнопки:\n"
-            "• Добавление\n• Массовое добавление\n• Массовое изменение статуса\n"
-            "• Печать QR-кодов\n• Копирование\n• Редактирование\n• Удаление\n\n"
-            "Источник: Реестр мебели.pdf, стр. 6, 9"
-        )
-
-    if "добавить" in q and "мебел" in q:
-        return (
-            "Поэтапная инструкция:\n"
-            "1. Нажать на кнопку 'Добавить'.\n"
-            "2. Заполнить поля: Модель, Подразделение, Кабинет, Инвентарный номер.\n"
-            "3. Нажать кнопку 'Сохранить'.\n\n"
-            "Источник: Реестр мебели.pdf, стр. 9"
-        )
-
-    if "статус" in q and ("мебел" in q or "техник" in q):
-        return (
-            "В реестре мебели предусмотрены статусы:\n"
-            "• Занят\n• Свободен\n• Списан\n\n"
-            "Источник: Реестр мебели.pdf, стр. 7"
-        )
-
-    return (
-        f"На основе найденной информации:\n\n{context}\n\n"
-        "Источник: документация БАРС Груп (точная страница неизвестна)"
-    )
-
-if __name__ == "__main__":
-    async def run_tests():
-        test_cases = [
-            ("Как выглядит интерфейс БО? Где найти производственный календарь?", "Тест 1"),
-            ("Опиши поэтапно как в БО добавить запись в реестр техники?", "Тест 12 (ЛОВУШКА)"),
-            ("Как приготовить борщ?", "Тест 14 (ВНЕ БАЗЫ)"),
-        ]
-        print(f"Модель: {OLLAMA_MODEL}, таймаут: {LLM_TIMEOUT} сек\n")
-        for question, test_name in test_cases:
-            print(f" {test_name}")
-            print(f"Вопрос: {question}")
-            ctx = "Какой-то контекст из документации"
-            answer = await ask_llm(ctx, [], question)
-            print(f"Ответ:\n{answer}")
-
-    asyncio.run(run_tests())
+        raise LLMError(str(e)) from e
+    return clean_answer(response.choices[0].message.content)

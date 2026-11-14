@@ -34,13 +34,14 @@ services:
       redis:
         condition: service_healthy
       qdrant:
-        condition: service_healthy  # <--- ВЕРНУЛИ service_healthy (чтобы app не стартовал, пока Qdrant не готов)
+        condition: service_healthy
     environment:
       - HF_HOME=/app/hf_cache
       - HF_ENDPOINT=https://hf-mirror.com
       - FASTEMBED_CACHE_PATH=/app/hf_cache
       - QDRANT_HOST=qdrant
-      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
+      - OLLAMA_MODEL=${OLLAMA_MODEL}
     volumes:
       - ./hf_cache:/app/hf_cache
     extra_hosts:
@@ -50,7 +51,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 120s
+      start_period: 60s
 
   bot:
     build: ./bot_service
@@ -59,9 +60,8 @@ services:
         condition: service_healthy
     env_file:
       - .env
-    restart: unless-stopped
     extra_hosts:
-      - "host.docker.internal:gost-gateway"
+      - "host.docker.internal:host-gateway"
 
 volumes:
   qdrant_data:
