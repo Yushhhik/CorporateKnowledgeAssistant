@@ -1,14 +1,18 @@
-"""Работа с Qdrant: эмбеддинги, создание коллекции, загрузка чанков.
+"""Работа с Qdrant: эмбеддинги, создание коллекции, загрузка чанков."""
 
-Эмбеддинги считаем локально (ключ OpenAI для этого не нужен).
-Модель multilingual-e5-small нормально понимает русский, размер вектора 384.
-"""
 import os
 import uuid
+from functools import lru_cache
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
-    Distance, FieldCondition, Filter, MatchValue, PayloadSchemaType, PointStruct, VectorParams,
+    Distance,
+    FieldCondition,
+    Filter,
+    MatchValue,
+    PayloadSchemaType,
+    PointStruct,
+    VectorParams,
 )
 from sentence_transformers import SentenceTransformer
 
@@ -23,24 +27,42 @@ _model = None
 
 
 def get_model() -> SentenceTransformer:
-    """Модель грузим один раз и переиспользуем."""
     global _model
+
     if _model is None:
         _model = SentenceTransformer(EMBEDDING_MODEL)
+
     return _model
 
 
 def embed_passages(texts: list[str]) -> list[list[float]]:
-    """Эмбеддинги для кусков документации. У e5 для них нужен префикс 'passage: '."""
     prefixed = [f"passage: {t}" for t in texts]
-    vectors = get_model().encode(prefixed, normalize_embeddings=True, show_progress_bar=False)
+
+    vectors = get_model().encode(
+        prefixed,
+        normalize_embeddings=True,
+        show_progress_bar=False
+    )
+
     return vectors.tolist()
 
 
+@lru_cache(maxsize=256)
+def _embed_query_cached(text: str) -> tuple:
+    vector = get_model().encode(
+        f"query: {text}",
+        normalize_embeddings=True
+    )
+
+    return tuple(vector.tolist())
+
+
 def embed_query(text: str) -> list[float]:
-    """Эмбеддинг вопроса пользователя. Префикс 'query: '."""
-    vector = get_model().encode(f"query: {text}", normalize_embeddings=True)
-    return vector.tolist()
+    return list(_embed_query_cached(text.strip()))
+
+
+def warm_up() -> None:
+    embed_query("прогрев")
 
 
 def get_client() -> QdrantClient:
@@ -48,63 +70,109 @@ def get_client() -> QdrantClient:
 
 
 def _create_source_index(client: QdrantClient) -> None:
-    """Индекс по полю source: быстрое удаление и подсчёт чанков конкретного файла."""
     try:
-        client.create_payload_index(COLLECTION_NAME, "source", PayloadSchemaType.KEYWORD)
+        client.create_payload_index(
+            COLLECTION_NAME,
+            "source",
+            PayloadSchemaType.KEYWORD
+        )
     except Exception:
-        pass  # индекс уже есть или клиент его не требует
+        pass
+
+
+def _create_system_index(client: QdrantClient) -> None:
+    try:
+        client.create_payload_index(
+            COLLECTION_NAME,
+            "system",
+            PayloadSchemaType.KEYWORD
+        )
+    except Exception:
+        pass
 
 
 def create_collection(client: QdrantClient, recreate: bool = True) -> None:
-    """Создаём коллекцию. recreate=True удалит старую вместе со всеми данными (полная переиндексация)."""
     if client.collection_exists(COLLECTION_NAME):
         if not recreate:
             return
+
         client.delete_collection(COLLECTION_NAME)
 
     client.create_collection(
         collection_name=COLLECTION_NAME,
-        vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
+        vectors_config=VectorParams(
+            size=VECTOR_SIZE,
+            distance=Distance.COSINE
+        ),
     )
+
     _create_source_index(client)
+    _create_system_index(client)
+
     print(f"Коллекция '{COLLECTION_NAME}' создана")
 
 
 def _source_filter(source: str) -> Filter:
-    return Filter(must=[FieldCondition(key="source", match=MatchValue(value=source))])
+    return Filter(
+        must=[
+            FieldCondition(
+                key="source",
+                match=MatchValue(value=source)
+            )
+        ]
+    )
 
 
 def delete_document(client: QdrantClient, source: str) -> None:
-    """Удаляет все чанки одного файла (по полю source), остальные не трогает."""
-    client.delete(collection_name=COLLECTION_NAME, points_selector=_source_filter(source))
+    client.delete(
+        collection_name=COLLECTION_NAME,
+        points_selector=_source_filter(source)
+    )
 
 
 def count_document(client: QdrantClient, source: str) -> int:
-    """Сколько чанков файла сейчас лежит в Qdrant."""
-    return client.count(COLLECTION_NAME, count_filter=_source_filter(source), exact=True).count
+    return client.count(
+        COLLECTION_NAME,
+        count_filter=_source_filter(source),
+        exact=True
+    ).count
 
 
 def chunk_point_id(source: str, index: int) -> str:
-    """Стабильный уникальный id точки: один и тот же файл и номер чанка всегда дают один и тот же id.
-    Нужен, чтобы чанки разных файлов не перезаписывали друг друга при инкрементальной загрузке."""
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source}#{index}"))
+    return str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"{source}#{index}"
+        )
+    )
 
 
 def _embed_text(chunk: dict) -> str:
-    """Для поиска к тексту добавляем название раздела: так заголовок тоже помогает находить кусок."""
-    return f"{chunk['section']}. {chunk['text']}"
+    section = chunk.get("section") or ""
+    return f"{section}. {chunk['text']}".strip()
 
 
-def upload_chunks(client: QdrantClient, chunks: list[dict], batch_size: int = 32) -> int:
-    """Загружаем чанки пачками. В payload кладём всё, что нужно для ответа и ссылки на источник."""
+def upload_chunks(
+    client: QdrantClient,
+    chunks: list[dict],
+    batch_size: int = 32
+) -> int:
+
     total = 0
+
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i:i + batch_size]
-        vectors = embed_passages([_embed_text(c) for c in batch])
+
+        vectors = embed_passages([
+            _embed_text(c) for c in batch
+        ])
 
         points = [
             PointStruct(
-                id=chunk_point_id(batch[j]["source"], i + j),
+                id=chunk_point_id(
+                    batch[j]["source"],
+                    i + j
+                ),
                 vector=vectors[j],
                 payload={
                     "type": batch[j]["type"],
@@ -113,11 +181,80 @@ def upload_chunks(client: QdrantClient, chunks: list[dict], batch_size: int = 32
                     "page": batch[j]["page"],
                     "text": batch[j]["text"],
                     "image_path": batch[j]["image_path"],
+                    "system": batch[j].get("system", "unknown"),
+                    "chunk_index": i + j,
                 },
             )
             for j in range(len(batch))
         ]
-        client.upsert(collection_name=COLLECTION_NAME, points=points)
+
+        client.upsert(
+            collection_name=COLLECTION_NAME,
+            points=points
+        )
+
         total += len(points)
         print(f"Загружено {total}/{len(chunks)}")
+
     return total
+
+
+def get_neighbors(client: QdrantClient, source: str, index: int) -> list[dict]:
+    ids = [chunk_point_id(source, k) for k in (index - 1, index + 1) if k >= 0]
+
+    points = client.retrieve(
+        COLLECTION_NAME,
+        ids=ids,
+        with_payload=True,
+        with_vectors=False
+    )
+
+    return sorted(
+        (p.payload for p in points),
+        key=lambda p: p.get("chunk_index", 0)
+    )
+
+
+def get_page_images(client: QdrantClient, source: str, page: int) -> list[dict]:
+    flt = Filter(must=[
+        FieldCondition(key="source", match=MatchValue(value=source)),
+        FieldCondition(key="type", match=MatchValue(value="image")),
+        FieldCondition(key="page", match=MatchValue(value=page)),
+    ])
+
+    result, offset = [], None
+
+    while True:
+        points, offset = client.scroll(
+            COLLECTION_NAME,
+            scroll_filter=flt,
+            limit=50,
+            offset=offset,
+            with_payload=True,
+            with_vectors=False
+        )
+        result.extend(p.payload for p in points)
+
+        if offset is None:
+            return result
+
+
+def stats(client: QdrantClient) -> dict:
+    result: dict = {}
+    offset = None
+
+    while True:
+        points, offset = client.scroll(
+            COLLECTION_NAME,
+            limit=256,
+            offset=offset,
+            with_payload=["source", "type"],
+            with_vectors=False
+        )
+
+        for p in points:
+            row = result.setdefault(p.payload["source"], {"text": 0, "image": 0})
+            row[p.payload.get("type", "text")] = row.get(p.payload.get("type", "text"), 0) + 1
+
+        if offset is None:
+            return result

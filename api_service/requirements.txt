@@ -10,3 +10,6 @@ openai
 python-docx
 pytest
 httpx
+Pillow
+pytesseract
+python-dotenv
