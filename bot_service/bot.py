@@ -1,63 +1,68 @@
 import asyncio
 import os
-import httpx
 from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
 load_dotenv()
+BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-PROXY_URL = "socks5://host.docker.internal:10808"
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
-FASTAPI_URL = "http://app:8000/webhook"
+def get_faq_keyboard():
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Как выглядит интерфейс БО?", callback_data="faq_interface")],
+        [InlineKeyboardButton(text="Как настроить фильтр?", callback_data="faq_filter")],
+        [InlineKeyboardButton(text="График офис-менеджера", callback_data="faq_manager")],
+        [InlineKeyboardButton(text="Как запустить командировку?", callback_data="faq_trip")]
+    ])
+    return keyboard
 
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    user_name = message.from_user.first_name
+    
+    greeting_text = (
+        f"Здравствуйте, {user_name}! 👋\n\n"
+        "Я - виртуальный помощник компании **БАРС Груп**. "
+        "Я изучил всю внутреннюю документацию "
+        "и готов ответить на ваши вопросы.\n\n"
+        "Выберите частый вопрос ниже или напишите свой текстом. "
+        "Если понадобится живой человек, просто напишите «оператор»."
+    )
+    
+    await message.answer(greeting_text, parse_mode="Markdown", reply_markup=get_faq_keyboard())
+
+@dp.message(Command("stop"))
+async def cmd_stop(message: Message):
+    await message.answer("Всего доброго! Если появятся вопросы - я всегда на связи. 👋")
+
+@dp.callback_query(F.data.startswith("faq_"))
+async def process_faq(callback: CallbackQuery):
+    questions = {
+        "faq_interface": "Как выглядит интерфейс БО?",
+        "faq_filter": "Как работает фильтр документа?",
+        "faq_manager": "Какой график работы у офис-менеджера?",
+        "faq_trip": "Как запустить бизнес-процесс командировки?"
+    }
+    question_text = questions.get(callback.data, "Вопрос не найден")
+    
+    await callback.answer()
+    await callback.message.answer(f"Вы выбрали вопрос: {question_text}\n\n(Скоро я отправлю его на сервер и дам ответ из документации!)")
+
+@dp.message(F.text)
+async def echo_handler(message: Message):
+    await message.answer(f"Вы написали: {message.text}. (Скоро я научусь отвечать по документации!)")
+
+@dp.message()
+async def handle_non_text(message: Message):
+    await message.answer("Я понимаю только текст. Пожалуйста, напишите ваш вопрос текстом.")
 
 async def main():
-    if not TOKEN:
-        print("❌ ОШИБКА: Токен не найден! Проверь файл .env")
-        return
-
-    session = AiohttpSession(proxy=PROXY_URL)
-
-    bot = Bot(token=TOKEN, session=session)
-    dp = Dispatcher()
-
-    @dp.message(Command("start"))
-    async def cmd_start(message: types.Message):
-        await message.answer("Привет! Я Corporate Knowledge Assistant. Задай мне любой вопрос по документации.")
-
-    @dp.message(lambda message: message.text is not None)
-    async def handle_text(message: types.Message):
-        print(f"📥 Бот получил сообщение: {message.text}")
-
-        user_text = message.text
-        user_id = message.from_user.id
-
-        await bot.send_chat_action(chat_id=message.chat.id, action="typing")
-
-        async with httpx.AsyncClient(trust_env=False) as client:
-            try:
-                response = await client.post(
-                    FASTAPI_URL,
-                    json={"user_id": user_id, "text": user_text},
-                    timeout=30.0
-                )
-                data = response.json()
-                reply_text = data.get("reply", "Ошибка: пустой ответ от сервера.")
-            except Exception as e:
-                reply_text = f"Ошибка подключения к серверу: {e}"
-
-        await message.answer(reply_text)
-
-    @dp.message()
-    async def handle_non_text(message: types.Message):
-        await message.answer("Извините, я понимаю только текст. Пожалуйста, напишите ваш вопрос словами.")
-
-    print("🚀 Бот запущен! Напиши ему в Телеграме.")
+    print("Бот запущен...")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
