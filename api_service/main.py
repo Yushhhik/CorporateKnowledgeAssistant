@@ -51,7 +51,7 @@ async def ask_llm(context: str, question: str, history: list, payload: dict):
     try:
         response = await asyncio.to_thread(
             ollama_client.chat.completions.create,
-            model="llama3.2",
+            model="llava"
             messages=messages,
             temperature=0.1,
             max_tokens=500
