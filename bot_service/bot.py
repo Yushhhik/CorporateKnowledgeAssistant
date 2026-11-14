@@ -3,6 +3,7 @@ import html
 import logging
 import os
 import re
+from collections import defaultdict, deque
 
 import httpx
 from dotenv import load_dotenv
@@ -33,6 +34,7 @@ OPERATOR_CHAT_ID = os.getenv("OPERATOR_CHAT_ID")
 BASE_API_URL = os.getenv("API_URL", "http://app:8000").rstrip("/")
 CORE_API_URL = f"{BASE_API_URL}/webhook"
 PROXY_URL = os.getenv("PROXY_URL") or None
+CORE_TIMEOUT = float(os.getenv("CORE_TIMEOUT", "180"))
 TG_LIMIT = 4000
 TEXT_CHUNK = 3500
 CAPTION_SAFE = 900
@@ -59,6 +61,8 @@ FAQ_BUTTONS = {
 }
 OPERATOR_RE = re.compile(r"\b(оператор\w*|человек\w*|живой)\b", re.IGNORECASE)
 
+local_history: dict[int, deque] = defaultdict(lambda: deque(maxlen=20))
+
 
 # вспомогательные функции
 def get_faq_keyboard() -> InlineKeyboardMarkup:
@@ -79,6 +83,11 @@ def main_keyboard() -> ReplyKeyboardMarkup:
         resize_keyboard=True,
         is_persistent=True,
     )
+
+
+def local_history_text(user_id: int) -> str:
+    items = local_history.get(user_id)
+    return "\n".join(items) if items else "История пуста."
 
 
 def chunks(text: str, size: int = TG_LIMIT) -> list[str]:
@@ -114,6 +123,15 @@ def md_to_html(text: str) -> str:
 
 def is_operator_request(text: str) -> bool:
     return bool(OPERATOR_RE.search(text)) and len(text.split()) <= 4
+
+
+async def keep_typing(chat_id: int) -> None:
+    while True:
+        try:
+            await bot.send_chat_action(chat_id, ChatAction.TYPING)
+        except Exception:
+            return
+        await asyncio.sleep(4)
 
 
 async def send_text(message: Message, text: str, markup: InlineKeyboardMarkup | None = None) -> None:
@@ -165,13 +183,13 @@ async def fetch_dialog_history(user_id: int) -> str:
         try:
             data = r.json()
         except ValueError:
-            return r.text or "История пуста."
+            return r.text or local_history_text(user_id)
         if isinstance(data, dict):
-            return str(data.get("history") or "История пуста.")
+            return str(data.get("history") or local_history_text(user_id))
         return str(data)
-    except Exception:
-        log.exception("Ошибка получения истории для %s", user_id)
-        return "Не удалось загрузить историю диалога."
+    except Exception as e:
+        log.warning("Ошибка получения истории для %s: %s", user_id, e)
+        return local_history_text(user_id)
 
 
 # основная логика
@@ -180,7 +198,8 @@ async def answer_question(message: Message, user: User, text: str) -> None:
         await escalate(message, user)
         return
 
-    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    local_history[user.id].append(f"Пользователь: {text}")
+    typing_task = asyncio.create_task(keep_typing(message.chat.id))
     try:
         r = await http.post(CORE_API_URL, json={"user_id": user.id, "text": text})
         r.raise_for_status()
@@ -192,6 +211,8 @@ async def answer_question(message: Message, user: User, text: str) -> None:
             reply_markup=operator_keyboard(),
         )
         return
+    finally:
+        typing_task.cancel()
 
     if data.get("status") == "error":
         await message.answer(
@@ -200,6 +221,7 @@ async def answer_question(message: Message, user: User, text: str) -> None:
         return
 
     reply = data.get("reply") or "Извините, я не смог сформировать ответ."
+    local_history[user.id].append(f"Бот: {reply}")
     markup = operator_keyboard() if data.get("suggest_operator") else None
 
     image_path = data.get("image_path")
@@ -312,7 +334,7 @@ async def main():
     else:
         bot = Bot(token=BOT_TOKEN)
 
-    http = httpx.AsyncClient(timeout=30.0, trust_env=False)
+    http = httpx.AsyncClient(timeout=httpx.Timeout(CORE_TIMEOUT, connect=10.0), trust_env=False)
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         log.info("Бот запущен, сервер: %s, прокси: %s", BASE_API_URL, "да" if PROXY_URL else "нет")

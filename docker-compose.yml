@@ -56,11 +56,10 @@ services:
     build: ./bot_service
     depends_on:
       app:
-        condition: service_started
+        condition: service_healthy
     env_file:
       - .env
-    environment:
-      - PROXY_URL=socks5://host.docker.internal:10808
+    restart: unless-stopped
     extra_hosts:
       - "host.docker.internal:gost-gateway"
 
