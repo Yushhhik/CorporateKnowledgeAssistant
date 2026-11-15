@@ -103,6 +103,10 @@ async def ask_llm(context: str, history: list, question: str, image_base64: str 
         print(f"[LLM] Кэш-попадание. Мгновенный ответ.")
         return _cache[cache_key]
 
+    if not context or not context.strip():
+        print("[LLM] Контекст пустой, LLM не вызывается")
+        return NO_ANSWER
+
     messages = build_prompt(context, history, question)
 
     if image_base64:
