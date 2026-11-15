@@ -25,6 +25,7 @@ os.environ["IMAGES_DIR"] = IMAGES_TMP
 
 
 def _stub(name: str, **attrs) -> None:
+    """Подставляет заглушку, только если настоящего пакета нет."""
     try:
         __import__(name)
         return
@@ -82,11 +83,11 @@ _stub("fastapi", FastAPI=_FakeFastAPI)
 _stub("fastapi.staticfiles", StaticFiles=_Rec)
 _stub("pydantic", BaseModel=_FakeBaseModel)
 
-import llm_service
-import main
-import prompts
-import qdrant_store
-import search
+import llm_service  # noqa: E402
+import main  # noqa: E402
+import prompts  # noqa: E402
+import qdrant_store  # noqa: E402
+import search  # noqa: E402
 
 NO_ANSWER = "Я не нашел точного ответа в документации. Переключить на оператора?"
 
@@ -103,8 +104,10 @@ def _payload(index, text, *, type_="text", page=9, section="5 Инструкци
 
 
 class FakeQdrant:
+    """Минимальная имитация QdrantClient: query_points / retrieve / scroll."""
+
     def __init__(self, scored, extra=()):
-        self.scored = scored
+        self.scored = scored                       # [(score, payload)]
         self.store = {}
         for _, p in scored:
             self.store[qdrant_store.chunk_point_id(p["source"], p["chunk_index"])] = p
@@ -187,7 +190,7 @@ class SearchLogicTests(unittest.TestCase):
         hits = search.search("график офис-менеджеров дежурства")
 
         self.assertEqual(hits[0]["page"], 3)
-        self.assertEqual(hits[0]["score"], 0.845)
+        self.assertEqual(hits[0]["score"], 0.845)      # чистый cosine, без бонуса
         self.assertEqual(hits[1]["score"], 0.85)
 
     def test_is_confident_uses_threshold(self):
@@ -203,15 +206,17 @@ class SearchLogicTests(unittest.TestCase):
 
         self.assertIsNotNone(context)
         self.assertTrue(context.startswith("[Источник: Реестр мебели, стр. 9]"))
+        # соседние чанки того же раздела подмешаны к лучшему
         self.assertIn("откройте реестр мебели", context)
         self.assertIn("нажать «Сохранить»", context)
+        # чанк ниже порога (другой документ, 0.80) в контекст не попал
         self.assertNotIn("Garantexpress", context)
         self.assertLessEqual(len(context), search.MAX_CONTEXT_CHARS)
 
         self.assertEqual(payload["source"], FURNITURE)
         self.assertEqual(payload["page"], 9)
         self.assertEqual(payload["sources"], ["Источник: Реестр мебели, стр. 9"])
-        self.assertEqual(payload["images"], [f"images/{IMG_NAME}"])
+        self.assertEqual(payload["images"], [f"images/{IMG_NAME}"])   # без дублей
 
     def test_below_threshold_gives_none(self):
         low = _payload(1, "Что-то случайное", page=1)
@@ -351,6 +356,7 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res["reply"], "Нажмите «Добавить».\n\nИсточник: Реестр мебели, стр. 9")
         self.assertFalse(res["suggest_operator"])
         self.assertEqual(res["image_path"], f"/images/{IMG_NAME}")
+        # обе реплики сохранены в хронологическом порядке (Redis хранит новые первыми)
         self.assertEqual(self.redis.data["chat:1"][1], "Пользователь: Как добавить запись?")
 
     async def test_missing_image_file_is_not_returned(self):
@@ -413,7 +419,7 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
             await self._ask("второй", user_id=7)
 
         second_history = llm.await_args_list[1].args[1]
-        self.assertEqual(second_history[1], "Пользователь: первый")
+        self.assertEqual(second_history[1], "Пользователь: первый")   # новые сообщения идут первыми
 
         text = (await main.history_endpoint(7))["history"].splitlines()
         self.assertEqual(text[0], "Пользователь: первый")

@@ -38,26 +38,31 @@ from docx.table import Table
 from docx.text.paragraph import Paragraph
 from PIL import Image
 
-PARSER_VERSION = "3"
+# Версия логики парсера. Меняй при правках parser.py: ingest.py увидит новую версию
+# и сам пересчитает все файлы (без ручного --full).
+PARSER_VERSION = "4"
 
 CHUNK_SIZE = 450
 CHUNK_OVERLAP = 80
 MIN_CHUNK_LEN = 40
-MIN_IMAGE_MAX_SIDE = 100
-MIN_IMAGE_MIN_SIDE = 12
+MIN_IMAGE_MAX_SIDE = 100      # картинки, у которых даже длинная сторона меньше (px), это иконки
+MIN_IMAGE_MIN_SIDE = 12       # и совсем тонкие полоски тоже пропускаем
 
 IMAGES_DIR = Path(os.getenv("IMAGES_DIR", "images"))
-CACHE_FILE = Path("image_descriptions.json")
+CACHE_FILE = Path("image_descriptions.json")   # кеш описаний, чтобы не платить за одно и то же дважды
 VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o")
 
 NOISE_RE = re.compile(r"Ошибка! Используйте вкладку.*?отображаться\.\s*–\s*\d+", re.S)
 PAGE_HEADER_RE = re.compile(r"(?m)^ЕИС\s*–.*$")
 
 
+# ----------------------------------------------------------------- текст
 
 def clean_text(text: str) -> str:
+    """Убираем мусор экспорта, переносы слов, лишние пробелы и переводы строк."""
     text = NOISE_RE.sub(" ", text)
     text = PAGE_HEADER_RE.sub(" ", text)
+    text = re.sub(r"[\uf000-\uf8ff\u200b]", "", text)   # значки-иконки шрифтов (Wingdings и т.п.), не текст
     text = text.replace("\xa0", " ")
     text = re.sub(r"-\n(?=\w)", "", text)
     text = re.sub(r"\s*\n\s*", " ", text)
@@ -66,6 +71,7 @@ def clean_text(text: str) -> str:
 
 
 def split_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
+    """Режем текст на куски ~size символов, стараясь резать по концу предложения или по пробелу."""
     chunks = []
     start, n = 0, len(text)
 
@@ -81,6 +87,7 @@ def split_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) 
                 end = start + cut + 1
 
         chunk = text[start:end].strip()
+        # короткий хвост отбрасываем (он уже покрыт перекрытием), но короткий единственный раздел оставляем
         if len(chunk) >= MIN_CHUNK_LEN or (not chunks and len(chunk) >= 12 and end >= n):
             chunks.append(chunk)
 
@@ -95,6 +102,7 @@ def split_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) 
 
 
 def _is_toc(piece: str) -> bool:
+    """Оглавление ("Раздел........5") в базу знаний не нужно."""
     return bool(re.search(r"\.{5,}", piece))
 
 
@@ -103,6 +111,7 @@ def _text_chunk(source: str, section: str, page, text: str) -> dict:
             "page": page, "text": text, "image_path": None}
 
 
+# ------------------------------------------------------------- картинки
 
 def _load_cache() -> dict:
     if CACHE_FILE.exists():
@@ -146,6 +155,7 @@ _OCR_STATE: dict = {}
 
 
 def _ocr_langs() -> str | None:
+    """Языки tesseract или None, если OCR недоступен (нет pytesseract или самого tesseract). Проверяем один раз."""
     if "langs" not in _OCR_STATE:
         langs = None
         try:
@@ -162,6 +172,7 @@ def _ocr_langs() -> str | None:
 
 
 def _ocr_image(img: Image.Image) -> str:
+    """Текст со скриншота через tesseract. Только уверенно распознанные слова, чтобы не тащить мусор."""
     langs = _ocr_langs()
     if not langs:
         return ""
@@ -175,7 +186,7 @@ def _ocr_image(img: Image.Image) -> str:
             img = bg
         gray = img.convert("L")
         w, h = gray.size
-        if h < 200:
+        if h < 200:                                   # узкие полоски с кнопками надо увеличить
             k = min(4, -(-200 // h))
             gray = gray.resize((w * k, h * k), Image.LANCZOS)
         data = pytesseract.image_to_data(gray, lang=langs, config="--psm 6",
@@ -200,6 +211,11 @@ def _ocr_image(img: Image.Image) -> str:
 def make_image_chunk(img_bytes: bytes, source: str, stem: str, section: str, context: str,
                      seen: set, page=None, skip_if_few_colors: bool = False,
                      native_size: tuple | None = None) -> dict | None:
+    """Картинка -> чанк с описанием. Описание: vision-модель OpenAI, иначе OCR, иначе заглушка.
+
+    described=True только если описание получено от vision-модели (ingest.py повторит
+    попытку для остальных, когда ключ заработает). method: vision | ocr | placeholder.
+    """
     key = hashlib.md5(img_bytes).hexdigest()
     if key in seen:
         return None
@@ -209,16 +225,16 @@ def make_image_chunk(img_bytes: bytes, source: str, stem: str, section: str, con
         img = Image.open(BytesIO(img_bytes))
         img.load()
     except Exception:
-        return None
+        return None  # например emf/wmf, которые Pillow не открывает
 
-    nw, nh = native_size or img.size
+    nw, nh = native_size or img.size       # размер картинки в файле (для PDF render увеличивает crop)
     if max(nw, nh) < MIN_IMAGE_MAX_SIDE or min(nw, nh) < MIN_IMAGE_MIN_SIDE:
-        return None
+        return None                        # иконки (лупа, значки) не нужны
     if skip_if_few_colors:
         small = img.convert("RGB").resize((64, 64))
         colors = small.getcolors(maxcolors=4096)
         if colors is not None and len(colors) <= 6:
-            return None
+            return None  # пустые заглушки вроде красного крестика
 
     if img.mode not in ("RGB", "RGBA", "L", "P"):
         img = img.convert("RGB")
@@ -227,7 +243,7 @@ def make_image_chunk(img_bytes: bytes, source: str, stem: str, section: str, con
     img.save(out_path, "PNG")
 
     cache = _load_cache()
-    cache_key = f"{VISION_MODEL}:{key}"
+    cache_key = f"{VISION_MODEL}:{key}"       # у другой модели будет своё описание
     desc = cache.get(cache_key)
     method = "vision" if desc else None
     if not desc and os.getenv("OPENAI_API_KEY"):
@@ -236,7 +252,7 @@ def make_image_chunk(img_bytes: bytes, source: str, stem: str, section: str, con
             cache[cache_key] = desc
             CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
             method = "vision"
-    described = bool(desc)
+    described = bool(desc)                    # True только если описание реально получено от модели
     if not desc:
         ocr = _ocr_image(img)
         if ocr:
@@ -251,6 +267,7 @@ def make_image_chunk(img_bytes: bytes, source: str, stem: str, section: str, con
             "text": desc, "image_path": str(out_path), "described": described, "method": method}
 
 
+# ----------------------------------------------------------------- DOCX
 
 def _heading_level(style_name: str) -> int | None:
     m = re.match(r"(?:Heading|Заголовок)\s*(\d+)", style_name or "", re.I)
@@ -258,12 +275,13 @@ def _heading_level(style_name: str) -> int | None:
 
 
 def _rows_to_lines(rows: list[list[str]]) -> list[str]:
+    """Строки таблицы -> строки вида 'Колонка: значение; Колонка2: значение2.'"""
     rows = [[" ".join((c or "").split()) for c in r] for r in rows]
     rows = [r for r in rows if any(r)]
     if not rows:
         return []
 
-    if max(len(r) for r in rows) == 1:
+    if max(len(r) for r in rows) == 1:           # врезки "Важно" и т.п.
         return [r[0] for r in rows if r[0]]
 
     header = rows[0]
@@ -286,7 +304,7 @@ def _table_lines(table: Table) -> list[str]:
     for row in table.rows:
         cells, prev = [], None
         for cell in row.cells:
-            if cell._tc is prev:
+            if cell._tc is prev:       # объединённые ячейки повторяются, выкидываем дубли
                 continue
             prev = cell._tc
             cells.append(cell.text)
@@ -350,8 +368,10 @@ def parse_docx(path: Path) -> list[dict]:
     return chunks
 
 
+# ------------------------------------------------------------------ PDF
+
 _TOC_TITLES = {"table of contents", "содержание", "оглавление", "1 содержание"}
-_NUM_HEADING_RE = re.compile(r"^\d+(?:\.\d+)*\.?\s+(?!\d+\.)\S")
+_NUM_HEADING_RE = re.compile(r"^\d+(?:\.\d+)*\.?\s+(?!\d+\.)\S")   # "5 Инструкция", "2.1.1 Фильтры", но не "1. Шаг"
 
 
 def _norm_line(text: str) -> str:
@@ -373,6 +393,8 @@ def _inside(obj: dict, boxes: list) -> bool:
 
 
 def _looks_like_table(rows: list[list]) -> bool:
+    """Настоящая таблица: минимум 2 строки и 2 колонки, большинство ячеек заполнено, ячейки короткие.
+    Рамки-врезки ("Важно") и сетки из пустых ячеек таблицами не считаем: их текст лучше брать как есть."""
     if len(rows) < 2 or max(len(r) for r in rows) < 2:
         return False
     cells = [(c or "").strip() for r in rows for c in r]
@@ -381,6 +403,7 @@ def _looks_like_table(rows: list[list]) -> bool:
 
 
 def _extract_page(page, n: int) -> dict:
+    """Одна страница -> элементы в порядке чтения: строки, таблицы, картинки."""
     items, images = [], []
 
     boxes, tables = [], []
@@ -395,8 +418,8 @@ def _extract_page(page, n: int) -> dict:
 
     view = page.filter(lambda o: o.get("object_type") != "char" or not _inside(o, boxes)) if boxes else page
     for ln in view.extract_text_lines():
-        text = ln["text"].strip()
-        if not text or re.search(r"\.{5,}\s*\d*\s*$", text):
+        text = re.sub(r"[\uf000-\uf8ff\u200b]", "", ln["text"]).strip()
+        if not text or re.search(r"\.{5,}\s*\d*\s*$", text):   # пустое или строка оглавления "Раздел.......5"
             continue
         size, bold = _line_style(ln)
         items.append({"kind": "line", "top": ln["top"], "text": text, "size": size, "bold": bold})
@@ -412,7 +435,7 @@ def _extract_page(page, n: int) -> dict:
         try:
             bbox = (max(img["x0"], 0), max(img["top"], 0),
                     min(img["x1"], page.width), min(img["bottom"], page.height))
-            dpi = int(min(300, max(150, sw / w * 72)))
+            dpi = int(min(300, max(150, sw / w * 72)))     # рендерим не хуже исходного разрешения
             pil = page.crop(bbox).to_image(resolution=dpi).original
             buf = BytesIO()
             pil.save(buf, "PNG")
@@ -424,6 +447,7 @@ def _extract_page(page, n: int) -> dict:
 
 
 def _strip_running_headers(pages: list[dict]) -> None:
+    """Колонтитулы и повторяющийся мусор: строки с верха/низа страницы, которые встречаются на многих страницах."""
     if len(pages) < 4:
         return
     counts: dict = {}
@@ -442,6 +466,7 @@ def _strip_running_headers(pages: list[dict]) -> None:
 
 
 def _find_headings(pages: list[dict]) -> dict[int, int]:
+    """Помечает строки-заголовки (it['heading']=True) и возвращает {округлённый размер: уровень}."""
     weights: dict = {}
     for p in pages:
         for it in p["items"]:
@@ -462,14 +487,17 @@ def _find_headings(pages: list[dict]) -> dict[int, int]:
             short = len(text) <= 110 and not text.endswith((",", ";", ":"))
             numbered = bool(_NUM_HEADING_RE.match(text))
             is_toc_title = text.strip().lower() in _TOC_TITLES
-            if short and not is_toc_title and (
+            # заголовок: жирный и заметно крупнее обычного текста (или с номером раздела), либо очень крупный.
+            # Жирные слова внутри абзацев и подписи врезок ("Важно") под это не попадают.
+            has_words = sum(ch.isalpha() for ch in text) >= 3     # значок или номер без слов заголовком не считаем
+            if short and has_words and not is_toc_title and (
                     (bold >= 0.6 and (size >= body * 1.3 or (numbered and size >= body * 1.05)))
                     or size >= body * 1.5):
                 it["heading"] = True
                 sizes.add(round(size))
                 if prev is not None and abs(prev["size"] - size) < 0.5 and it["top"] - prev["top"] < size * 2.2:
-                    prev["text"] += " " + text
-                    it["heading"] = None
+                    prev["text"] += " " + text          # заголовок, перенесённый на вторую строку
+                    it["heading"] = None               # помечаем на удаление
                 else:
                     prev = it
             else:
@@ -523,7 +551,7 @@ def parse_pdf(path: Path) -> list[dict]:
                 buf.append(ev["text"])
             elif ev["kind"] == "table":
                 buf.extend(_rows_to_lines(ev["rows"]))
-            else:
+            else:   # image
                 ch = make_image_chunk(ev["png"], path.name, path.stem, section,
                                       _context_before(p["items"], ev["top"]), seen,
                                       page=n, skip_if_few_colors=True, native_size=ev["native"])
@@ -533,6 +561,7 @@ def parse_pdf(path: Path) -> list[dict]:
     return chunks
 
 
+# ----------------------------------------------------------------- общее
 
 def parse_file(path: Path) -> list[dict]:
     if path.suffix.lower() == ".docx":
@@ -543,6 +572,7 @@ def parse_file(path: Path) -> list[dict]:
 
 
 def list_document_files(folder: str | Path) -> list[Path]:
+    """Все .docx и .pdf из папки. Если есть и docx, и pdf с одним именем, берём docx."""
     folder = Path(folder)
     by_stem: dict[str, Path] = {}
     for p in sorted(folder.iterdir()):
@@ -554,6 +584,7 @@ def list_document_files(folder: str | Path) -> list[Path]:
 
 
 def parse_folder(folder: str | Path) -> list[dict]:
+    """Все документы из папки -> единый список чанков."""
     all_chunks = []
     for p in list_document_files(folder):
         chunks = parse_file(p)

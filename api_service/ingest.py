@@ -1,6 +1,3 @@
-
-"""Инкрементальная загрузка: документы -> чанки -> эмбеддинги -> Qdrant."""
-
 import hashlib
 import json
 import os
@@ -76,7 +73,6 @@ def why_reprocess(
     in_qdrant: int,
     vision: bool
 ) -> str | None:
-
     if entry is None:
         return "новый файл"
 

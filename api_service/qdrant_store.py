@@ -1,3 +1,4 @@
+
 """Работа с Qdrant: эмбеддинги, создание коллекции, загрузка чанков."""
 
 import os
@@ -27,6 +28,7 @@ _model = None
 
 
 def get_model() -> SentenceTransformer:
+    """Загружаем модель один раз."""
     global _model
 
     if _model is None:
@@ -36,6 +38,7 @@ def get_model() -> SentenceTransformer:
 
 
 def embed_passages(texts: list[str]) -> list[list[float]]:
+    """Эмбеддинги для фрагментов документов."""
     prefixed = [f"passage: {t}" for t in texts]
 
     vectors = get_model().encode(
@@ -58,10 +61,12 @@ def _embed_query_cached(text: str) -> tuple:
 
 
 def embed_query(text: str) -> list[float]:
+    """Эмбеддинг пользовательского вопроса (повторные вопросы берутся из кэша)."""
     return list(_embed_query_cached(text.strip()))
 
 
 def warm_up() -> None:
+    """Загружает модель заранее, чтобы первый вопрос пользователя не ждал."""
     embed_query("прогрев")
 
 
@@ -70,6 +75,7 @@ def get_client() -> QdrantClient:
 
 
 def _create_source_index(client: QdrantClient) -> None:
+    """Индекс для быстрого поиска по имени документа."""
     try:
         client.create_payload_index(
             COLLECTION_NAME,
@@ -81,6 +87,7 @@ def _create_source_index(client: QdrantClient) -> None:
 
 
 def _create_system_index(client: QdrantClient) -> None:
+    """Индекс для фильтрации по системе."""
     try:
         client.create_payload_index(
             COLLECTION_NAME,
@@ -92,6 +99,7 @@ def _create_system_index(client: QdrantClient) -> None:
 
 
 def create_collection(client: QdrantClient, recreate: bool = True) -> None:
+    """Создаём коллекцию Qdrant."""
     if client.collection_exists(COLLECTION_NAME):
         if not recreate:
             return
@@ -124,6 +132,7 @@ def _source_filter(source: str) -> Filter:
 
 
 def delete_document(client: QdrantClient, source: str) -> None:
+    """Удаляем все чанки конкретного документа."""
     client.delete(
         collection_name=COLLECTION_NAME,
         points_selector=_source_filter(source)
@@ -131,6 +140,7 @@ def delete_document(client: QdrantClient, source: str) -> None:
 
 
 def count_document(client: QdrantClient, source: str) -> int:
+    """Количество чанков конкретного документа."""
     return client.count(
         COLLECTION_NAME,
         count_filter=_source_filter(source),
@@ -139,6 +149,7 @@ def count_document(client: QdrantClient, source: str) -> int:
 
 
 def chunk_point_id(source: str, index: int) -> str:
+    """Стабильный уникальный ID чанка."""
     return str(
         uuid.uuid5(
             uuid.NAMESPACE_URL,
@@ -157,6 +168,7 @@ def upload_chunks(
     chunks: list[dict],
     batch_size: int = 32
 ) -> int:
+    """Загружаем чанки и их метаданные в Qdrant."""
 
     total = 0
 
@@ -200,6 +212,7 @@ def upload_chunks(
 
 
 def get_neighbors(client: QdrantClient, source: str, index: int) -> list[dict]:
+    """Соседние чанки (index-1, index+1) того же документа: для расширения контекста."""
     ids = [chunk_point_id(source, k) for k in (index - 1, index + 1) if k >= 0]
 
     points = client.retrieve(
@@ -216,6 +229,7 @@ def get_neighbors(client: QdrantClient, source: str, index: int) -> list[dict]:
 
 
 def get_page_images(client: QdrantClient, source: str, page: int) -> list[dict]:
+    """Все картинки указанной страницы документа (с постраничной выборкой)."""
     flt = Filter(must=[
         FieldCondition(key="source", match=MatchValue(value=source)),
         FieldCondition(key="type", match=MatchValue(value="image")),
@@ -240,6 +254,7 @@ def get_page_images(client: QdrantClient, source: str, page: int) -> list[dict]:
 
 
 def stats(client: QdrantClient) -> dict:
+    """{source: {'text': n, 'image': m}}: для проверки, что все PDF загружены."""
     result: dict = {}
     offset = None
 
