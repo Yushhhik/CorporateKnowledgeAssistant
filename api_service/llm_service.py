@@ -11,7 +11,7 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "sprashivaem_u_natashi")
 LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "120"))
 
 _client: openai.OpenAI | None = None
-_SOURCE_LINE_RE = re.compile(r"(?im)^\s*источник(?:и)?\s*:.*$")
+_SOURCE_LINE_RE = re.compile(r"(?im)^\s*источник(?:и)?\s*[:—-].*$")
 _REFUSAL_RE = re.compile(r"не нашел точного ответа", re.IGNORECASE)
 
 _cache: dict[str, str] = {}
@@ -84,12 +84,16 @@ def print_stats():
     print(f"Мин. время ответа:   {s['min_time']:.2f} сек")
 
 
-def clean_answer(text: str | None) -> str:
+def clean_answer(text: str | None, context: str = "") -> str:
     text = (text or "").strip()
     if not text or _REFUSAL_RE.search(text):
         return NO_ANSWER
+    source_match = _SOURCE_LINE_RE.search(text)
+    source_text = source_match.group(0).strip() if source_match else None
     text = _SOURCE_LINE_RE.sub("", text).strip()
-    return text or NO_ANSWER
+    if not source_text:
+        source_text = "Источник: документация БАРС Груп"
+    return f"{text}\n\n{source_text}" if text else NO_ANSWER
 
 
 async def ask_llm(context: str, history: list, question: str, image_base64: str | None = None) -> str:
@@ -126,7 +130,7 @@ async def ask_llm(context: str, history: list, question: str, image_base64: str 
             temperature=0.1,
             max_tokens=500,
         )
-        answer = clean_answer(response.choices[0].message.content)
+        answer = clean_answer(response.choices[0].message.content, context)
 
         _cache[cache_key] = answer
         _cleanup_cache()
@@ -141,7 +145,11 @@ async def ask_llm(context: str, history: list, question: str, image_base64: str 
 
     finally:
         elapsed = time.time() - start_time
-        _update_stats_time(elapsed)
+        _stats["total_time"] += elapsed
+        if elapsed > _stats["max_time"]:
+            _stats["max_time"] = elapsed
+        if elapsed < _stats["min_time"]:
+            _stats["min_time"] = elapsed
         print(
             f"[LLM] Запрос #{_stats['total_requests']} | время: {elapsed:.2f} сек | успехов: {_stats['successful']} | ошибок: {_stats['errors']}")
 
