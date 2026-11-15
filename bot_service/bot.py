@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import html
 import io
 import json
@@ -56,6 +57,8 @@ ADMIN_BUTTON_TEXT = "⚙️ Панель управления"
 EMPLOYEE_ID_MAX_LEN = 100
 DOC_EXTENSIONS = (".pdf", ".docx")
 DOC_MAX_SIZE = 20 * 1024 * 1024
+PHOTO_MAX_SIZE = 10 * 1024 * 1024
+PHOTO_WAIT = 600
 
 if not BOT_TOKEN:
     raise SystemExit("TELEGRAM_TOKEN не задан")
@@ -138,6 +141,7 @@ exchange_seq = int(time.time())
 rated: set[int] = set()
 operator_threads: OrderedDict[int, int] = OrderedDict()
 pending_access: dict[int, str] = {}
+pending_photos: dict[int, tuple[float, str]] = {}
 
 
 def load_stats() -> dict:
@@ -365,7 +369,7 @@ class AccessMiddleware(BaseMiddleware):
         state: FSMContext = data["state"]
         current = await state.get_state()
         text = event.text or ""
-        if current == Registration.waiting_id.state and not text.startswith("/"):
+        if current == Registration.waiting_id.state and text and not text.startswith("/"):
             return await handler(event, data)
         await begin_registration(event, state)
         return None
@@ -534,6 +538,68 @@ async def answer_question(message: Message, user: User, text: str, state: FSMCon
             if sent:
                 await send_text(message, reply, markup, parse_mode)
                 return
+    await send_text(message, reply, markup, parse_mode)
+
+
+async def answer_question_with_photo(
+    message: Message, user: User, image_base64: str, text: str, state: FSMContext | None = None
+) -> None:
+    count("requests", user.id)
+    local_history[user.id].append(f"Пользователь: [фото] {text}")
+    started = time.monotonic()
+    typing_task = asyncio.create_task(keep_typing(message.chat.id))
+    notice_task = asyncio.create_task(slow_notice(message))
+    try:
+        r = await http.post(
+            CORE_API_URL,
+            json={"user_id": user.id, "text": text, "image_base64": image_base64},
+        )
+        if r.status_code in (401, 403):
+            data = {"status": "unauthorized"}
+        else:
+            r.raise_for_status()
+            data = r.json()
+        if not isinstance(data, dict):
+            raise ValueError("Неверный формат ответа сервера")
+    except Exception:
+        log.exception("Ошибка запроса к серверу с фото")
+        count("errors")
+        await message.answer(
+            "Произошла ошибка при обработке фото. Попробуйте позже или свяжитесь с оператором.",
+            reply_markup=operator_keyboard(),
+        )
+        return
+    finally:
+        typing_task.cancel()
+        notice_task.cancel()
+
+    if data.get("status") == "unauthorized":
+        authorized.discard(user.id)
+        save_authorized()
+        if not is_admin(user.id) and state is not None:
+            await begin_registration(message, state)
+            return
+
+    if data.get("status") == "error":
+        count("errors")
+        await message.answer(
+            data.get("reply") or "Не удалось обработать фото.", reply_markup=operator_keyboard()
+        )
+        return
+
+    stats["latency_sum"] += time.monotonic() - started
+    stats["latency_n"] += 1
+    reply = data.get("reply") or "Извините, я не смог распознать изображение."
+    parse_mode = data.get("parse_mode")
+    if parse_mode not in ("Markdown", "HTML"):
+        parse_mode = "HTML"
+    local_history[user.id].append(f"Бот: {reply}")
+    if data.get("suggest_operator"):
+        count("not_found")
+        markup = operator_keyboard()
+    else:
+        count("answered")
+        markup = feedback_keyboard(remember_exchange(user.id, f"[фото] {text}", reply))
     await send_text(message, reply, markup, parse_mode)
 
 
@@ -967,12 +1033,47 @@ async def process_admin_document_invalid(message: Message):
 @router.message(F.text)
 async def handle_text(message: Message, state: FSMContext):
     log.info("Сообщение от %s, длина %s", message.from_user.id, len(message.text))
+    pending = pending_photos.pop(message.from_user.id, None)
+    if pending and time.monotonic() - pending[0] <= PHOTO_WAIT:
+        await answer_question_with_photo(message, message.from_user, pending[1], message.text.strip(), state)
+        return
     await answer_question(message, message.from_user, message.text.strip(), state)
+
+
+@router.message(F.photo)
+async def handle_photo(message: Message, state: FSMContext):
+    photo = message.photo[-1]
+    log.info("Фото от %s, размер %s", message.from_user.id, photo.file_size)
+    if photo.file_size and photo.file_size > PHOTO_MAX_SIZE:
+        await message.answer("Фото слишком большое, максимум 10 МБ. Отправьте другое изображение.")
+        return
+    try:
+        buf = io.BytesIO()
+        await bot.download(photo, destination=buf)
+        image_base64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception:
+        log.exception("Не удалось скачать фото")
+        await message.answer("Не удалось получить фото. Попробуйте ещё раз.")
+        return
+    user = message.from_user
+    caption = (message.caption or "").strip()
+    if caption:
+        pending_photos.pop(user.id, None)
+        await answer_question_with_photo(message, user, image_base64, caption, state)
+        return
+    now = time.monotonic()
+    for uid in [u for u, (t, _) in pending_photos.items() if now - t > PHOTO_WAIT]:
+        pending_photos.pop(uid, None)
+    pending_photos[user.id] = (now, image_base64)
+    await message.answer(
+        "Скриншот получил. Напишите, что вы хотите узнать о нём, например: «Как настроить этот фильтр?». "
+        "Я отвечу по документации с учётом изображения."
+    )
 
 
 @router.message()
 async def handle_non_text(message: Message):
-    await message.answer("Я понимаю только текст. Пожалуйста, напишите ваш вопрос текстом.")
+    await message.answer("Я понимаю только текст и фотографии. Пожалуйста, напишите ваш вопрос текстом или пришлите скриншот.")
 
 
 # запуск
