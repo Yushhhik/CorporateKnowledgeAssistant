@@ -2,6 +2,7 @@ import asyncio
 import os
 import re
 import hashlib
+import time
 import openai
 from prompts import NO_ANSWER, build_prompt
 
@@ -16,6 +17,15 @@ _REFUSAL_RE = re.compile(r"не нашел точного ответа", re.IGNO
 _cache: dict[str, str] = {}
 _CACHE_MAX_SIZE = 1000
 
+_stats = {
+    "total_requests": 0,
+    "cache_hits": 0,
+    "successful": 0,
+    "errors": 0,
+    "total_time": 0.0,
+    "max_time": 0.0,
+    "min_time": float("inf"),
+}
 
 class LLMError(Exception):
     pass
@@ -47,6 +57,33 @@ def _cleanup_cache():
             del _cache[key]
 
 
+def _update_stats_time(elapsed: float):
+    _stats["total_time"] += elapsed
+    if elapsed > _stats["max_time"]:
+        _stats["max_time"] = elapsed
+    if elapsed < _stats["min_time"]:
+        _stats["min_time"] = elapsed
+
+
+def get_stats() -> dict:
+    total = _stats["total_requests"]
+    avg_time = round(_stats["total_time"] / total, 2) if total > 0 else 0.0
+    return {**_stats, "avg_time": avg_time,
+            "min_time": round(_stats["min_time"], 2) if _stats["min_time"] != float("inf") else 0.0}
+
+
+def print_stats():
+    s = get_stats()
+    print("Статистика LLM сервиса")
+    print(f"Всего запросов:      {s['total_requests']}")
+    print(f"Попаданий в кэш:     {s['cache_hits']}")
+    print(f"Успешных ответов:    {s['successful']}")
+    print(f"Ошибок:              {s['errors']}")
+    print(f"Среднее время:       {s['avg_time']} сек")
+    print(f"Макс. время ответа:  {s['max_time']:.2f} сек")
+    print(f"Мин. время ответа:   {s['min_time']:.2f} сек")
+
+
 def clean_answer(text: str | None) -> str:
     text = (text or "").strip()
     if not text or _REFUSAL_RE.search(text):
@@ -56,10 +93,14 @@ def clean_answer(text: str | None) -> str:
 
 
 async def ask_llm(context: str, history: list, question: str, image_base64: str | None = None) -> str:
+    _stats["total_requests"] += 1
+    start_time = time.time()
+
     cache_key = _make_cache_key(context, question)
 
     if cache_key in _cache:
-        print(f"[LLM] Кэш-попадание! Возвращаю сохранённый ответ.")
+        _stats["cache_hits"] += 1
+        print(f"[LLM] Кэш-попадание. Мгновенный ответ.")
         return _cache[cache_key]
 
     messages = build_prompt(context, history, question)
@@ -81,16 +122,59 @@ async def ask_llm(context: str, history: list, question: str, image_base64: str 
             temperature=0.1,
             max_tokens=500,
         )
+        answer = clean_answer(response.choices[0].message.content)
+
+        _cache[cache_key] = answer
+        _cleanup_cache()
+        _stats["successful"] += 1
+        print(f"[LLM] Кэш-промах. Новый ответ сохранен. Размер кэша: {len(_cache)}")
+        return answer
+
     except Exception as e:
+        _stats["errors"] += 1
+        print(f"[LLM] Ошибка LLM: {e}")
         raise LLMError(str(e)) from e
 
-    answer = clean_answer(response.choices[0].message.content)
-    _cache[cache_key] = answer
-    _cleanup_cache()
-    print(f"[LLM] Кэш-промах. Новый ответ сохранен. Размер кэша: {len(_cache)}")
-    return answer
+    finally:
+        elapsed = time.time() - start_time
+        _update_stats_time(elapsed)
+        print(
+            f"[LLM] Запрос #{_stats['total_requests']} | время: {elapsed:.2f} сек | успехов: {_stats['successful']} | ошибок: {_stats['errors']}")
 
 
 def clear_cache():
     _cache.clear()
-    print(f"[LLM] Кэш очищен.")
+    print("[LLM] Кэш очищен.")
+
+
+def reset_stats():
+    global _stats
+    _stats = {
+        "total_requests": 0, "cache_hits": 0, "successful": 0, "errors": 0,
+        "total_time": 0.0, "max_time": 0.0, "min_time": float("inf"),
+    }
+    print("[LLM] Статистика сброшена.")
+
+
+if __name__ == "__main__":
+    async def run_demo():
+        print("Запуск демо-теста LLM сервиса с кэшем и метриками...\n")
+        ctx = "Реестр мебели: кнопка Добавить, поля Модель, Подразделение, Кабинет. Источник: Реестр.pdf, стр. 5"
+        test_questions = [
+            "Как добавить запись в реестр мебели?",
+            "Как добавить запись в реестр мебели?",
+            "Как приготовить борщ?",
+        ]
+
+        for q in test_questions:
+            print(f"\nВопрос: {q}")
+            try:
+                answer = await ask_llm(ctx, [], q)
+                print(f"Ответ бота: {answer[:100]}...")
+            except LLMError:
+                print("LLM недоступна")
+
+        print_stats()
+
+
+    asyncio.run(run_demo())
