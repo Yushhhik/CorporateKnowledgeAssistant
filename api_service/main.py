@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from llm_service import LLMError, ask_llm
-from prompts import NO_ANSWER
+from prompts import NO_ANSWER, furniture_note
 import time
 
 import features
@@ -42,6 +42,7 @@ app.mount("/images", StaticFiles(directory=str(IMAGES_DIR)), name="images")
 
 DOCS_DIR = Path("/app/docs")
 DOCS_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/docs", StaticFiles(directory=str(DOCS_DIR)), name="docs")
 
 
 class TelegramMessage(BaseModel):
@@ -249,24 +250,35 @@ async def receive_message(msg: TelegramMessage, db: AsyncSession = Depends(get_d
         related: list[str] = []
         source = None
 
-        if context is None and not msg.image_base64:
+        if context is None:
             answer = NO_ANSWER
             suggest_operator = True
         else:
-            answer = await ask_llm(context if context else "", history, msg.text, image_base64=msg.image_base64)
+            answer = await ask_llm(context, history, msg.text, image_base64=msg.image_base64)
 
             if answer == NO_ANSWER:
                 suggest_operator = True
             else:
+                note = furniture_note(msg.text, context)
+                if note and "реестра техники нет" not in answer:
+                    answer = f"{note} Возможно, вы имели в виду реестр мебели?\n\n{answer}"
+
+                public_url = os.getenv("PUBLIC_API_URL", "http://127.0.0.1:8000").rstrip("/")
                 if payload and payload.get("sources"):
-                    answer = f"{answer}\n\n" + "\n".join(payload["sources"])
+                    sources = [
+                        s.replace("](/docs/", f"]({public_url}/docs/")
+                        for s in payload["sources"]
+                    ]
+                    answer = f"{answer}\n\n" + "\n".join(sources)
                 if payload:
                     images = _image_urls(payload)
                     related = payload.get("related") or []
                     source = payload.get("source")
 
         await save_to_history(msg.user_id, f"Пользователь: {msg.text}")
-        await save_to_history(msg.user_id, f"Бот: {answer}")
+
+        if not suggest_operator:
+            await save_to_history(msg.user_id, f"Бот: {answer}")
 
         response = {
             "reply": answer,
