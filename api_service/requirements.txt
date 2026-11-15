@@ -13,3 +13,5 @@ httpx
 Pillow
 pytesseract
 python-dotenv
+sqlalchemy[asyncio]
+asyncpg

@@ -9,3 +9,5 @@ venv/
 qdrant_storage/
 qdrant_data/
 .DS_Store
+images/
+docs/
