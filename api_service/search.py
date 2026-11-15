@@ -17,20 +17,24 @@ from qdrant_store import (
     warm_up,
 )
 
+from features import related_titles
+
 log = logging.getLogger("rag.search")
 
 TOP_K = 5
+# Порог по косинусной близости. Подставьте значение, которое подсказал test_search.py
 CONFIDENCE_THRESHOLD = 0.8359
 CONTEXT_CHUNKS = 3
 
-CANDIDATES = 15
-LEXICAL_WEIGHT = 0.05
+CANDIDATES = 15          # сколько кандидатов берём из Qdrant перед пересортировкой
+LEXICAL_WEIGHT = 0.05    # максимальная добавка за совпадение слов; score для порога остаётся чистым
 MAX_CONTEXT_CHARS = 3500
 
 _client = None
 
 
 def _get_client():
+    """Переиспользуем подключение к Qdrant."""
     global _client
 
     if _client is None:
@@ -40,11 +44,14 @@ def _get_client():
 
 
 def warm() -> None:
+    """Вызвать один раз при старте бота: грузит модель и проверяет Qdrant."""
     warm_up()
     _get_client().get_collections()
 
 
 def detect_system(query: str) -> str | None:
+    """Определяет систему, если пользователь явно назвал её."""
+
     query = (query or "").lower()
 
     if "sap" in query:
@@ -74,6 +81,7 @@ _WORD_RE = re.compile(r"[a-zа-яё0-9]+", re.IGNORECASE)
 
 
 def _stem(word: str) -> str:
+    """Грубое усечение окончаний: «командировку» и «командировка» совпадут."""
     return word[:5] if len(word) > 5 else word
 
 
@@ -94,11 +102,18 @@ def search(
     chunk_type: str | None = None,
     system: str | None = None
 ) -> list[dict]:
+    """Ищет ближайшие чанки с возможной фильтрацией по системе.
+
+    Порядок результатов уточняется совпадением слов, но поле score — это чистая
+    косинусная близость: именно по ней калибруется порог.
+    """
+
     query = (query or "").strip()
 
     if not query:
         return []
 
+    # Если система не передана явно, определяем её по вопросу
     if system is None:
         system = detect_system(query)
 
@@ -157,6 +172,8 @@ async def search_async(
     chunk_type: str | None = None,
     system: str | None = None
 ) -> list[dict]:
+    """Асинхронная версия поиска."""
+
     return await asyncio.to_thread(search, query, top_k, chunk_type, system)
 
 
@@ -164,6 +181,8 @@ def is_confident(
     hits: list[dict],
     threshold: float | None = None
 ) -> bool:
+    """Проверяет score лучшего результата."""
+
     if threshold is None:
         threshold = CONFIDENCE_THRESHOLD
 
@@ -171,6 +190,8 @@ def is_confident(
 
 
 def format_source(hit: dict) -> str:
+    """Формирует ссылку на источник."""
+
     name = Path(hit["source"]).stem
 
     if hit.get("page"):
@@ -180,6 +201,8 @@ def format_source(hit: dict) -> str:
 
 
 def _expand(best: dict) -> str:
+    """Текст лучшего чанка + соседние текстовые чанки: ответ не обрывается на середине."""
+
     parts = [best["text"]]
 
     if best.get("chunk_index") is None or best["type"] != "text":
@@ -206,6 +229,8 @@ def _expand(best: dict) -> str:
 
 
 def _collect_images(best: dict, good: list[dict]) -> list[str]:
+    """Пути картинок: из найденных чанков и со страницы лучшего чанка."""
+
     paths = [h["image_path"] for h in good if h.get("image_path")]
 
     if best.get("page") is not None:
@@ -255,6 +280,7 @@ def _search_qdrant_sync(query: str) -> tuple[str | None, dict | None]:
         "citation": format_source(best),
         "image_path": best["image_path"],
         "images": _collect_images(best, good),
+        "related": related_titles(hits, best, CONFIDENCE_THRESHOLD),
         "system": best["system"],
         "sources": list(dict.fromkeys(format_source(h) for h in good)),
     }
@@ -266,6 +292,13 @@ async def search_qdrant(
     query: str,
     raise_errors: bool = False
 ) -> tuple[str | None, dict | None]:
+    """Интерфейс для интегратора: context, payload = await search_qdrant(msg.text).
+
+    По умолчанию не бросает исключений: при сбое Qdrant/модели возвращает (None, None),
+    и бот отвечает как на вопрос без ответа в базе. API передаёт raise_errors=True,
+    чтобы недоступность Qdrant не выдавалась за «ответа нет в документации».
+    """
+
     try:
         return await asyncio.to_thread(_search_qdrant_sync, query)
     except Exception:

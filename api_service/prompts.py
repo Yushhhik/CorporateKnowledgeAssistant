@@ -1,5 +1,6 @@
 from typing import List, Dict
 
+# Единственный источник правды для отказа: его же использует main.py, когда поиск ничего не нашёл.
 NO_ANSWER = "Я не нашел точного ответа в документации. Переключить на оператора?"
 
 SYSTEM_PROMPT = """Ты — корпоративный ассистент службы поддержки БАРС Груп.
@@ -31,6 +32,7 @@ def build_prompt(context: str, history: List[str], question: str) -> List[Dict]:
             f"'{NO_ANSWER}'"
         )
     else:
+        # replace, а не str.format: фигурные скобки в тексте документации не должны ломать промпт
         system_content = (
             SYSTEM_PROMPT
             .replace("__NO_ANSWER__", NO_ANSWER)
@@ -42,6 +44,7 @@ def build_prompt(context: str, history: List[str], question: str) -> List[Dict]:
         "content": system_content
     }
 
+    # В Redis история лежит от новых сообщений к старым, для модели нужен хронологический порядок
     history_messages = []
     for msg in reversed(history):
         if msg.startswith("Пользователь:"):
