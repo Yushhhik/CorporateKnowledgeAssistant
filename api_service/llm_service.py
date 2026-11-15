@@ -9,7 +9,7 @@ import time
 
 import openai
 
-from prompts import NO_ANSWER, REFUSE_TOKEN, build_prompt
+from prompts import NO_ANSWER, build_prompt
 
 log = logging.getLogger("rag.llm")
 
@@ -24,10 +24,7 @@ _client: openai.OpenAI | None = None
 
 # Источники добавляет код (из результатов поиска), а не модель: небольшие модели выдумывают страницы.
 _SOURCE_LINE_RE = re.compile(r"(?im)^\s*источник(?:и)?\s*[:—-].*$")
-_REFUSAL_RE = re.compile(
-    rf"не нашел точного ответа|не нашла точного ответа|__NO_ANSWER__|{re.escape(REFUSE_TOKEN)}|NO_ANSWER",
-    re.IGNORECASE,
-)
+_REFUSAL_RE = re.compile(r"не нашел точного ответа|не нашла точного ответа|__NO_ANSWER__", re.IGNORECASE)
 # Длинный ответ, в котором лишь упомянута оговорка, отказом не считается
 _REFUSAL_MAX_LEN = 250
 
@@ -125,12 +122,62 @@ def clean_answer(text: str | None, context: str = "", question: str = "") -> str
     return text or NO_ANSWER
 
 
-def _image_mime(b64: str) -> str:
-    if b64.startswith("iVBOR"):
-        return "image/png"
-    if b64.startswith("UklGR"):
-        return "image/webp"
-    return "image/jpeg"
+CONDENSE_PROMPT = (
+    "Перепиши последний вопрос пользователя так, чтобы он был понятен без истории диалога. "
+    "Подставь вместо местоимений и пропущенных слов конкретную тему из предыдущих реплик. "
+    "Ничего не отвечай и не добавляй. Выведи ТОЛЬКО переписанный вопрос одной строкой. "
+    "Если вопрос и так понятен сам по себе, выведи его без изменений."
+)
+CONDENSE_TIMEOUT = float(os.getenv("CONDENSE_TIMEOUT", "20"))
+
+
+def _short(text: str, limit: int) -> str:
+    text = _SOURCE_LINE_RE.sub("", text or "").strip().replace("\n", " ")
+    return text[:limit]
+
+
+async def condense_question(history: list, question: str, topic: str | None = None) -> str | None:
+    """Самостоятельная формулировка уточняющего вопроса для поиска («а как его удалить?» -> «Как удалить фильтр?»).
+
+    Любой сбой или странный ответ даёт None: тогда остаётся простая склейка с прошлым вопросом.
+    """
+    turns = []
+    items = list(reversed(history or []))[-4:]      # последние две пары, от старых к новым
+
+    for item in items:
+        if item.startswith("Пользователь:"):
+            turns.append(f"Пользователь: {_short(item.split(':', 1)[1], 200)}")
+        elif item.startswith("Бот:"):
+            turns.append(f"Ассистент: {_short(item.split(':', 1)[1], 250)}")
+
+    if topic:
+        turns.insert(0, f"Тема диалога: {_short(topic, 200)}")
+
+    if not turns:
+        return None
+
+    messages = [
+        {"role": "system", "content": CONDENSE_PROMPT},
+        {"role": "user", "content": "Диалог:\n" + "\n".join(turns) + f"\n\nПоследний вопрос: {question}\nПереписанный вопрос:"},
+    ]
+
+    try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                _get_client().chat.completions.create,
+                model=OLLAMA_MODEL, messages=messages, temperature=0, max_tokens=80,
+            ),
+            timeout=CONDENSE_TIMEOUT,
+        )
+        text = (response.choices[0].message.content or "").strip().split("\n")[0].strip(" \"'«»")
+    except Exception as e:
+        log.warning("не удалось переформулировать вопрос: %s", e)
+        return None
+
+    if not (5 <= len(text) <= 200) or _REFUSAL_RE.search(text):
+        return None
+
+    return text
 
 
 async def ask_llm(context: str, history: list, question: str, image_base64: str | None = None) -> str:
@@ -150,9 +197,6 @@ async def ask_llm(context: str, history: list, question: str, image_base64: str 
         _stats["cache_hits"] += 1
         return _cache[cache_key]
 
-    if image_base64:
-        history = []
-
     messages = build_prompt(context, history, question, has_image=bool(image_base64))
 
     if image_base64:
@@ -160,7 +204,7 @@ async def ask_llm(context: str, history: list, question: str, image_base64: str 
             if msg["role"] == "user":
                 msg["content"] = [
                     {"type": "text", "text": msg["content"]},
-                    {"type": "image_url", "image_url": {"url": f"data:{_image_mime(image_base64)};base64,{image_base64}"}},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
                 ]
                 break
 

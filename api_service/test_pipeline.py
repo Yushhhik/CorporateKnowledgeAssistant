@@ -79,7 +79,26 @@ _stub("sentence_transformers", SentenceTransformer=_Rec)
 _stub("openai", OpenAI=_Rec)
 _stub("redis")
 _stub("redis.asyncio", Redis=_Rec)
-_stub("fastapi", FastAPI=_FakeFastAPI)
+_stub(
+    "fastapi",
+    FastAPI=_FakeFastAPI,
+    HTTPException=Exception,
+    Depends=lambda *a, **k: None,
+    UploadFile=_Rec,
+    File=lambda *a, **k: None,
+    BackgroundTasks=_Rec,
+)
+_stub("fastapi.responses", JSONResponse=_Rec)
+_stub("sqlalchemy", select=lambda *a, **k: SimpleNamespace(where=lambda *x, **y: None))
+_stub("sqlalchemy.ext")
+_stub("sqlalchemy.ext.asyncio", AsyncSession=_Rec)
+_stub(
+    "database",
+    get_db=lambda: None,
+    init_db=lambda: None,
+    User=SimpleNamespace(telegram_id=1, is_verified=True, employee_id="1"),
+)
+_stub("ingest", main=lambda *a, **k: None)
 _stub("fastapi.staticfiles", StaticFiles=_Rec)
 _stub("pydantic", BaseModel=_FakeBaseModel)
 
@@ -320,6 +339,12 @@ class FakeRedis:
     async def lrange(self, key, start, end):
         return list(self.data.get(key, []))
 
+    async def get(self, key):
+        return self.data.get(key)
+
+    async def set(self, key, value, ex=None):
+        self.data[key] = value
+
 
 class BrokenRedis:
     async def lpush(self, *a):
@@ -334,6 +359,13 @@ PAYLOAD = {
 }
 
 
+class _VerifiedDB:
+    """Заглушка сессии БД: любой пользователь считается авторизованным сотрудником."""
+
+    async def execute(self, *args, **kwargs):
+        return SimpleNamespace(scalar_one_or_none=lambda: SimpleNamespace(is_verified=True))
+
+
 class WebhookTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.redis = FakeRedis()
@@ -342,7 +374,7 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(patcher.stop)
 
     async def _ask(self, text="Вопрос", user_id=1):
-        return await main.receive_message(main.TelegramMessage(user_id=user_id, text=text))
+        return await main.receive_message(main.TelegramMessage(user_id=user_id, text=text), db=_VerifiedDB())
 
     async def test_answer_with_sources_and_image(self):
         (Path(IMAGES_TMP) / IMG_NAME).write_bytes(b"png")
@@ -351,7 +383,7 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(main, "ask_llm", mock.AsyncMock(return_value="Нажмите «Добавить».")) as llm:
             res = await self._ask("Как добавить запись?")
 
-        llm.assert_awaited_once_with("ctx", [], "Как добавить запись?")
+        llm.assert_awaited_once_with("ctx", [], "Как добавить запись?", image_base64=None)
         self.assertEqual(res["status"], "success")
         self.assertEqual(res["reply"], "Нажмите «Добавить».\n\nИсточник: Реестр мебели, стр. 9")
         self.assertFalse(res["suggest_operator"])
@@ -424,6 +456,47 @@ class WebhookTests(unittest.IsolatedAsyncioTestCase):
         text = (await main.history_endpoint(7))["history"].splitlines()
         self.assertEqual(text[0], "Пользователь: первый")
         self.assertTrue(text[1].startswith("Бот: Ответ"))
+
+    async def test_followup_reuses_previous_fragments_and_rewrites_query(self):
+        search = mock.AsyncMock(side_effect=[("ctx про фильтр", PAYLOAD), (None, None)])
+
+        with mock.patch.object(main, "search_qdrant", search), \
+             mock.patch.object(main, "condense_question", mock.AsyncMock(return_value="Как удалить фильтр документа?")), \
+             mock.patch.object(main, "ask_llm", mock.AsyncMock(return_value="Ответ")) as llm:
+            await self._ask("Как работает фильтр документа?", user_id=9)
+            res = await self._ask("а как его удалить?", user_id=9)
+
+        self.assertEqual(search.await_args_list[1].args[0], "Как удалить фильтр документа?")
+        self.assertEqual(llm.await_args_list[1].args[0], "ctx про фильтр")   # поиск пуст, взяли прошлые фрагменты
+        self.assertEqual(res["status"], "success")
+        self.assertFalse(res["suggest_operator"])
+        self.assertIn("Реестр мебели", res["reply"])                          # источники прошлого ответа сохранились
+
+    async def test_followup_without_previous_answer_still_refuses(self):
+        with mock.patch.object(main, "search_qdrant", mock.AsyncMock(return_value=(None, None))), \
+             mock.patch.object(main, "condense_question", mock.AsyncMock(return_value=None)):
+            res = await self._ask("а подробнее?", user_id=10)
+
+        self.assertTrue(res["suggest_operator"])
+
+    async def test_chain_of_six_followups_keeps_original_topic(self):
+        found = ("ctx про фильтр", PAYLOAD)
+        search = mock.AsyncMock(side_effect=[found] + [(None, None)] * 6)
+        followups = ["а подробнее?", "а где эта кнопка?", "приведи пример", "а если нет прав?", "что дальше?", "а как его сбросить?"]
+
+        with mock.patch.object(main, "search_qdrant", search), \
+             mock.patch.object(main, "condense_question", mock.AsyncMock(return_value=None)), \
+             mock.patch.object(main, "ask_llm", mock.AsyncMock(return_value="Ответ")) as llm:
+            await self._ask("Как работает фильтр документа?", user_id=11)
+            for q in followups:
+                res = await self._ask(q, user_id=11)
+                self.assertFalse(res["suggest_operator"], q)
+
+        for call in search.await_args_list[1:]:
+            self.assertTrue(call.args[0].startswith("Как работает фильтр документа?"), call.args[0])
+            self.assertNotIn("а подробнее? ", call.args[0].split(". ", 1)[0])
+        self.assertEqual(len(llm.await_args_list), 7)
+        self.assertGreaterEqual(len(llm.await_args_list[-1].args[1]), 10)     # в историю попадают последние 5 обменов
 
 
 if __name__ == "__main__":

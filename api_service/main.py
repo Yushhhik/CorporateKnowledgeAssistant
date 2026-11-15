@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from llm_service import LLMError, ask_llm
+from llm_service import LLMError, ask_llm, condense_question
 from prompts import NO_ANSWER, furniture_note
 import time
 
@@ -34,6 +34,7 @@ r = redis.Redis(
     socket_timeout=3,
 )
 
+MAX_FOLLOWUP_CONTEXT = 4500
 SERVICE_ERROR = "Извините, сервис временно недоступен. Попробуйте позже или свяжитесь с оператором."
 
 IMAGES_DIR = Path(os.getenv("IMAGES_DIR", "images"))
@@ -94,7 +95,7 @@ async def save_to_history(user_id: int, text: str):
     key = f"chat:{user_id}"
     try:
         await r.lpush(key, text)
-        await r.ltrim(key, 0, 9)
+        await r.ltrim(key, 0, 19)
         await r.expire(key, 86400)
     except Exception as e:
         log.warning("Redis недоступен, история не сохранена: %s", e)
@@ -114,7 +115,7 @@ async def history_endpoint(user_id: int):
     return {"history": "\n".join(reversed(items))}
 
 
-def _image_urls(payload: dict, limit: int = 2) -> list[str]:
+def _image_urls(payload: dict, limit: int = 4) -> list[str]:
     urls = []
     for path in [payload.get("image_path"), *(payload.get("images") or [])]:
         if path and (IMAGES_DIR / Path(path).name).is_file():
@@ -235,8 +236,16 @@ async def receive_message(msg: TelegramMessage, db: AsyncSession = Depends(get_d
 
         history = await get_history(msg.user_id)
 
-        search_query = features.contextualize(msg.text, history)
+        topic = await features.topic_get(r, msg.user_id)
+        search_query = features.contextualize(msg.text, history, topic)
         standalone = search_query == msg.text.strip()
+        followup = not standalone and not msg.image_base64
+
+        if followup:
+            # Уточнение («а как его удалить?»): просим модель дописать тему, иначе остаётся склейка с прошлым вопросом
+            rewritten = await condense_question(history, msg.text, topic)
+            if rewritten:
+                search_query = rewritten
 
         cached = await features.cache_get(r, msg.text) if standalone and not msg.image_base64 else None
 
@@ -250,6 +259,15 @@ async def receive_message(msg: TelegramMessage, db: AsyncSession = Depends(get_d
             context, payload = None, None
         else:
             context, payload = await search_qdrant(search_query, raise_errors=True)
+
+            if followup:
+                # Ничего нового не нашлось или нашлось мало: опираемся на фрагменты прошлого ответа
+                previous = await features.ctx_get(r, msg.user_id)
+                if previous and previous.get("context"):
+                    if not context:
+                        context, payload = previous["context"], previous.get("payload") or None
+                    elif previous["context"][:200] not in context:
+                        context = f"{context}\n\n{previous['context']}"[:MAX_FOLLOWUP_CONTEXT]
 
         suggest_operator = False
         images: list[str] = []
@@ -265,22 +283,23 @@ async def receive_message(msg: TelegramMessage, db: AsyncSession = Depends(get_d
             if answer == NO_ANSWER:
                 suggest_operator = True
             else:
-                note = None if msg.image_base64 else furniture_note(msg.text, context or "")
+                note = furniture_note(msg.text, context or "")
                 if note and "реестра техники нет" not in answer:
                     answer = f"{note} Возможно, вы имели в виду реестр мебели?\n\n{answer}"
 
                 if payload and payload.get("sources"):
                     answer = f"{answer}\n\n" + "\n".join(payload["sources"])
                 if payload:
-                    # на фото пользователя картинки из документации не прикладываем
-                    images = [] if msg.image_base64 else _image_urls(payload)
+                    images = _image_urls(payload)
                     related = payload.get("related") or []
                     source = payload.get("source")
 
-        # обмен про фото в историю не пишем: он мешает следующим текстовым вопросам
-        if not msg.image_base64:
-            await save_to_history(msg.user_id, f"Пользователь: {msg.text}")
-            await save_to_history(msg.user_id, f"Бот: {answer}")
+        await save_to_history(msg.user_id, f"Пользователь: {msg.text}")
+        await save_to_history(msg.user_id, f"Бот: {answer}")
+
+        if not suggest_operator and context and not image_only:
+            await features.ctx_save(r, msg.user_id, context, payload)
+            await features.topic_save(r, msg.user_id, search_query)
 
         response = {
             "reply": answer,

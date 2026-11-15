@@ -101,3 +101,42 @@ class Analytics(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FollowUps(unittest.TestCase):
+    H = [
+        "Бот: Фильтр документа задаётся в поле под названием столбца.",
+        "Пользователь: Как работает фильтр документа?",
+    ]
+
+    def test_detects_short_followups(self):
+        for q in ["А подробнее?", "а где эта кнопка", "Что дальше?", "приведи пример", "а второй шаг?", "а если нет прав?"]:
+            self.assertTrue(features.is_followup(q, self.H), q)
+
+    def test_standalone_questions_are_not_followups(self):
+        for q in ["Как оформить командировку в системе?", "Какой график работы у офис-менеджера в филиале?"]:
+            self.assertFalse(features.is_followup(q, self.H), q)
+
+    def test_no_history_no_followup(self):
+        self.assertFalse(features.is_followup("а подробнее?", []))
+
+    def test_refused_question_is_not_used_as_topic(self):
+        history = [
+            "Бот: Я не нашел точного ответа в документации. Переключить на оператора?",
+            "Пользователь: Какая погода в Казани?",
+            "Бот: Фильтр документа задаётся в поле столбца.",
+            "Пользователь: Как работает фильтр документа?",
+        ]
+        self.assertEqual(features.last_user_question(history), "Как работает фильтр документа?")
+        history2 = [
+            "Бот: Я не нашел точного ответа в документации. Переключить на оператора?",
+            "Пользователь: Какая погода в Казани?",
+            "Бот: Фильтр документа задаётся в поле столбца.",
+            "Пользователь: Как работает фильтр документа?",
+        ][:2] + history[2:]
+        self.assertEqual(features.last_user_question(history2), "Как работает фильтр документа?")
+        only_refused = history[:2]
+        self.assertIsNone(features.last_user_question(only_refused))
+
+    def test_followup_search_query_contains_topic(self):
+        self.assertIn("фильтр", features.contextualize("а подробнее?", self.H).lower())
