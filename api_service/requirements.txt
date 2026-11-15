@@ -15,3 +15,4 @@ pytesseract
 python-dotenv
 sqlalchemy[asyncio]
 asyncpg
+python-multipart
