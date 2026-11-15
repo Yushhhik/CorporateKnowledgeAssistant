@@ -26,12 +26,15 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     User,
 )
+
+import analytics
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -52,13 +55,14 @@ ADMIN_IDS = {int(x) for x in re.findall(r"-?\d+", os.getenv("ADMIN_IDS", ""))}
 TG_LIMIT = 4000
 TEXT_CHUNK = 3500
 CAPTION_SAFE = 900
-OPERATOR_BUTTON_TEXT = "👤 Связаться с оператором"
-ADMIN_BUTTON_TEXT = "⚙️ Панель управления"
+OPERATOR_BUTTON_TEXT = "Связаться с оператором"
+ADMIN_BUTTON_TEXT = "Панель управления"
 EMPLOYEE_ID_MAX_LEN = 100
 DOC_EXTENSIONS = (".pdf", ".docx")
 DOC_MAX_SIZE = 20 * 1024 * 1024
 PHOTO_MAX_SIZE = 10 * 1024 * 1024
 PHOTO_WAIT = 600
+STATS_DEFAULT_PERIOD = "7d"
 
 if not BOT_TOKEN:
     raise SystemExit("TELEGRAM_TOKEN не задан")
@@ -105,7 +109,7 @@ HELP_TEXT = (
     "/stop — попрощаться"
 )
 
-ADMIN_HELP_TEXT = "\n/admin — панель управления\n/cancel — отменить текущее действие"
+ADMIN_HELP_TEXT = "\n/admin — панель управления\n/stats — аналитика бота\n/cancel — отменить текущее действие"
 
 BASE_COMMANDS = [
     BotCommand(command="start", description="Приветствие и частые вопросы"),
@@ -116,7 +120,7 @@ BASE_COMMANDS = [
 
 ADMIN_COMMANDS = [
     BotCommand(command="admin", description="Панель управления"),
-    BotCommand(command="stats", description="Статистика бота"),
+    BotCommand(command="stats", description="Аналитика бота"),
     BotCommand(command="cancel", description="Отменить действие"),
 ]
 
@@ -134,6 +138,18 @@ COUNTERS = (
     "registrations",
     "access_requests",
 )
+
+EVENT_MAP = {
+    "answered": ("question", "answered"),
+    "not_found": ("question", "not_found"),
+    "errors": ("question", "error"),
+    "escalations": ("escalation", None),
+    "operator_replies": ("operator_reply", None),
+    "feedback_positive": ("feedback", "positive"),
+    "feedback_negative": ("feedback", "negative"),
+    "registrations": ("registration", None),
+    "access_requests": ("access_request", None),
+}
 
 local_history: dict[int, deque] = defaultdict(lambda: deque(maxlen=20))
 exchanges: OrderedDict[int, tuple[int, str, str]] = OrderedDict()
@@ -212,10 +228,31 @@ def access_request_keyboard(user_id: int) -> InlineKeyboardMarkup:
 def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats")],
-            [InlineKeyboardButton(text="📄 Добавить документ в базу знаний", callback_data="adm:upload")],
-            [InlineKeyboardButton(text="📚 Список документов", callback_data="adm:docs")],
-            [InlineKeyboardButton(text="✖️ Закрыть", callback_data="adm:close")],
+            [InlineKeyboardButton(text="Статистика", callback_data="adm:stats")],
+            [InlineKeyboardButton(text="Добавить документ в базу знаний", callback_data="adm:upload")],
+            [InlineKeyboardButton(text="Список документов", callback_data="adm:docs")],
+            [InlineKeyboardButton(text="Закрыть", callback_data="adm:close")],
+        ]
+    )
+
+
+def stats_keyboard(period: str) -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(text=("• " if key == period else "") + label, callback_data=f"st:view:{key}")
+        for key, label in analytics.PERIODS.items()
+    ]
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            buttons[:2],
+            buttons[2:],
+            [
+                InlineKeyboardButton(text="Слабые места", callback_data=f"st:weak:{period}"),
+                InlineKeyboardButton(text="Частые вопросы", callback_data=f"st:top:{period}"),
+            ],
+            [
+                InlineKeyboardButton(text="Экспорт CSV", callback_data=f"st:csv:{period}"),
+                InlineKeyboardButton(text="Обновить", callback_data=f"st:view:{period}"),
+            ],
         ]
     )
 
@@ -266,11 +303,14 @@ def save_authorized() -> None:
         log.warning("Не удалось сохранить список авторизованных: %s", e)
 
 
-def count(name: str, user_id: int | None = None) -> None:
+def count(name: str, user_id: int | None = None, **fields) -> None:
     stats[name] = stats.get(name, 0) + 1
     if user_id is not None and user_id not in stats["users"]:
         stats["users"].append(user_id)
     save_stats()
+    mapping = EVENT_MAP.get(name)
+    if mapping:
+        analytics.record(mapping[0], user_id, outcome=mapping[1], **fields)
 
 
 def write_feedback_log(payload: dict) -> None:
@@ -280,30 +320,6 @@ def write_feedback_log(payload: dict) -> None:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
     except Exception as e:
         log.warning("Не удалось записать отзыв: %s", e)
-
-
-def stats_text() -> str:
-    def pct(a: int, b: int) -> str:
-        return f"{a / b * 100:.0f}%" if b else "—"
-
-    total = stats["requests"]
-    pos = stats["feedback_positive"]
-    neg = stats["feedback_negative"]
-    avg = stats["latency_sum"] / stats["latency_n"] if stats["latency_n"] else None
-    lines = [
-        "📊 Статистика бота",
-        f"Пользователей: {len(stats['users'])}",
-        f"Вопросов: {total}",
-        f"Ответ найден: {stats['answered']} ({pct(stats['answered'], total)})",
-        f"Не найдено, предложен оператор: {stats['not_found']} ({pct(stats['not_found'], total)})",
-        f"Ошибок: {stats['errors']} ({pct(stats['errors'], total)})",
-        f"Вызовов оператора: {stats['escalations']}",
-        f"Регистраций: {stats['registrations']}, запросов доступа: {stats['access_requests']}",
-        f"Ответов оператора через бота: {stats['operator_replies']}",
-        f"Оценки: 👍 {pos} / 👎 {neg}, полезных {pct(pos, pos + neg)}",
-        f"Среднее время ответа: {avg:.1f} с" if avg is not None else "Среднее время ответа: —",
-    ]
-    return "\n".join(lines)
 
 
 def remember_exchange(user_id: int, question: str, answer: str) -> int:
@@ -483,7 +499,7 @@ async def answer_question(message: Message, user: User, text: str, state: FSMCon
             raise ValueError("Неверный формат ответа сервера")
     except Exception:
         log.exception("Ошибка запроса к серверу")
-        count("errors")
+        count("errors", user.id, question=text)
         await message.answer(
             "Произошла ошибка при обработке вашего запроса. Попробуйте позже или свяжитесь с оператором.",
             reply_markup=operator_keyboard(),
@@ -507,13 +523,14 @@ async def answer_question(message: Message, user: User, text: str, state: FSMCon
             return
 
     if data.get("status") == "error":
-        count("errors")
+        count("errors", user.id, question=text)
         await message.answer(
             data.get("reply") or "Не удалось обработать запрос.", reply_markup=operator_keyboard()
         )
         return
 
-    stats["latency_sum"] += time.monotonic() - started
+    latency = time.monotonic() - started
+    stats["latency_sum"] += latency
     stats["latency_n"] += 1
     reply = data.get("reply") or "Извините, я не смог сформировать ответ."
     parse_mode = data.get("parse_mode")
@@ -521,10 +538,10 @@ async def answer_question(message: Message, user: User, text: str, state: FSMCon
         parse_mode = "HTML"
     local_history[user.id].append(f"Бот: {reply}")
     if data.get("suggest_operator"):
-        count("not_found")
+        count("not_found", user.id, question=text, latency=latency)
         markup = operator_keyboard()
     else:
-        count("answered")
+        count("answered", user.id, question=text, latency=latency)
         markup = feedback_keyboard(remember_exchange(user.id, text, reply))
 
     image_path = data.get("image_path")
@@ -563,7 +580,7 @@ async def answer_question_with_photo(
             raise ValueError("Неверный формат ответа сервера")
     except Exception:
         log.exception("Ошибка запроса к серверу с фото")
-        count("errors")
+        count("errors", user.id, question=f"[фото] {text}")
         await message.answer(
             "Произошла ошибка при обработке фото. Попробуйте позже или свяжитесь с оператором.",
             reply_markup=operator_keyboard(),
@@ -581,13 +598,14 @@ async def answer_question_with_photo(
             return
 
     if data.get("status") == "error":
-        count("errors")
+        count("errors", user.id, question=f"[фото] {text}")
         await message.answer(
             data.get("reply") or "Не удалось обработать фото.", reply_markup=operator_keyboard()
         )
         return
 
-    stats["latency_sum"] += time.monotonic() - started
+    latency = time.monotonic() - started
+    stats["latency_sum"] += latency
     stats["latency_n"] += 1
     reply = data.get("reply") or "Извините, я не смог распознать изображение."
     parse_mode = data.get("parse_mode")
@@ -595,10 +613,10 @@ async def answer_question_with_photo(
         parse_mode = "HTML"
     local_history[user.id].append(f"Бот: {reply}")
     if data.get("suggest_operator"):
-        count("not_found")
+        count("not_found", user.id, question=f"[фото] {text}", latency=latency)
         markup = operator_keyboard()
     else:
-        count("answered")
+        count("answered", user.id, question=f"[фото] {text}", latency=latency)
         markup = feedback_keyboard(remember_exchange(user.id, f"[фото] {text}", reply))
     await send_text(message, reply, markup, parse_mode)
 
@@ -695,7 +713,37 @@ async def upload_document(name: str, content: bytes, mime: str) -> None:
 
 
 async def show_admin_panel(message: Message) -> None:
-    await message.answer("⚙️ Панель управления", reply_markup=admin_keyboard())
+    await message.answer("Панель управления", reply_markup=admin_keyboard())
+
+
+async def show_dashboard(message: Message, period: str, edit: bool = False) -> None:
+    try:
+        png, caption = await asyncio.to_thread(analytics.build_dashboard, period)
+    except Exception:
+        log.exception("Не удалось сформировать аналитику")
+        await message.answer("Не удалось сформировать отчёт. Попробуйте позже.")
+        return
+    keyboard = stats_keyboard(period)
+    if png is None:
+        if edit:
+            try:
+                await message.edit_text(caption, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            except TelegramBadRequest:
+                pass
+        else:
+            await message.answer(caption, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        return
+    photo = BufferedInputFile(png, filename="analytics.png")
+    if edit:
+        try:
+            await message.edit_media(
+                InputMediaPhoto(media=photo, caption=caption, parse_mode=ParseMode.HTML),
+                reply_markup=keyboard,
+            )
+        except TelegramBadRequest:
+            log.warning("Не удалось обновить сообщение с аналитикой")
+    else:
+        await message.answer_photo(photo, caption=caption, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 
 async def escalate(message: Message, user: User) -> None:
@@ -747,7 +795,7 @@ async def operator_reply(message: Message):
         await message.reply("Не удалось доставить ответ: пользователь мог заблокировать бота.")
         return
     local_history[target].append(f"Оператор: {message.text}")
-    count("operator_replies")
+    count("operator_replies", target)
     await message.reply("✅ Ответ отправлен пользователю.")
 
 
@@ -796,7 +844,7 @@ async def cmd_stats(message: Message):
     if not is_admin(message.from_user.id):
         await message.answer("Команда недоступна.")
         return
-    await message.answer(stats_text())
+    await show_dashboard(message, STATS_DEFAULT_PERIOD)
 
 
 @router.message(Command("stop"))
@@ -848,7 +896,7 @@ async def process_call_admin(callback: CallbackQuery):
     if not await notify_admins(text, user.id, access_request_keyboard(user.id)):
         await callback.message.answer("Не получилось связаться с администратором. Попробуйте, пожалуйста, позже.")
         return
-    count("access_requests")
+    count("access_requests", user.id)
     await callback.message.answer("Я передал вашу заявку специалисту. Как только доступ откроют, я напишу вам.")
 
 
@@ -909,7 +957,7 @@ async def process_admin_action(callback: CallbackQuery, state: FSMContext):
         return
     action = callback.data.split(":", 1)[1]
     if action == "stats":
-        await callback.message.answer(stats_text())
+        await show_dashboard(callback.message, STATS_DEFAULT_PERIOD)
     elif action == "upload":
         await state.set_state(AdminPanel.waiting_document)
         await callback.message.answer(
@@ -922,12 +970,48 @@ async def process_admin_action(callback: CallbackQuery, state: FSMContext):
             log.exception("Не удалось получить список документов")
             await callback.message.answer("Не удалось получить список документов.")
             return
-        await callback.message.answer("📚 Документы в базе:\n" + "\n".join(f"• {n}" for n in names) if names else "База документов пуста.")
+        await callback.message.answer("Документы в базе:\n" + "\n".join(f"• {n}" for n in names) if names else "База документов пуста.")
     elif action == "close":
         try:
             await callback.message.delete()
         except TelegramBadRequest:
             pass
+
+
+@router.callback_query(F.data.startswith("st:"))
+async def process_stats(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    await callback.answer()
+    if not isinstance(callback.message, Message):
+        return
+    try:
+        _, action, period = callback.data.split(":")
+    except ValueError:
+        return
+    if period not in analytics.PERIODS:
+        return
+    message = callback.message
+    try:
+        if action == "view":
+            await show_dashboard(message, period, edit=True)
+        elif action == "weak":
+            await message.answer(await asyncio.to_thread(analytics.weak_spots_text, period), parse_mode=ParseMode.HTML)
+        elif action == "top":
+            await message.answer(await asyncio.to_thread(analytics.top_questions_text, period), parse_mode=ParseMode.HTML)
+        elif action == "csv":
+            data = await asyncio.to_thread(analytics.export_csv, period)
+            if data is None:
+                await message.answer("За выбранный период нет данных для экспорта.")
+                return
+            await message.answer_document(
+                BufferedInputFile(data, filename=f"bot_events_{period}_{time.strftime('%Y%m%d')}.csv"),
+                caption=f"События бота: {analytics.PERIODS[period]}",
+            )
+    except Exception:
+        log.exception("Ошибка при формировании отчёта %s", action)
+        await message.answer("Не удалось сформировать отчёт. Попробуйте позже.")
 
 
 @router.callback_query(F.data.startswith("fb:"))
@@ -954,7 +1038,7 @@ async def process_feedback(callback: CallbackQuery):
             await callback.message.edit_reply_markup(reply_markup=None)
         except TelegramBadRequest:
             pass
-    count("feedback_positive" if positive else "feedback_negative", user.id)
+    count("feedback_positive" if positive else "feedback_negative", user.id, question=question)
     write_feedback_log(
         {
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
