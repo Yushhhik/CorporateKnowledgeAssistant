@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 import re
 import sys
 from pathlib import Path
@@ -24,7 +25,15 @@ log = logging.getLogger("rag.search")
 TOP_K = 5
 # Порог по косинусной близости. Подставьте значение, которое подсказал test_search.py
 CONFIDENCE_THRESHOLD = 0.8359
-CONTEXT_CHUNKS = 3
+CONTEXT_CHUNKS = 4
+
+# «Мягкая зона»: сразу ниже порога фрагмент всё равно берём, если в нём есть слова вопроса.
+# Одним порогом по косинусной близости нельзя отделить вопросы «живыми словами» от посторонних,
+# поэтому такие вопросы раньше получали «нет информации», хотя ответ в документе был.
+SOFT_MARGIN = float(os.getenv("SEARCH_SOFT_MARGIN", "0.06"))
+MIN_OVERLAP = float(os.getenv("SEARCH_MIN_OVERLAP", "0.5"))
+MIN_MATCHED_WORDS = 2
+PLACEHOLDER_PREFIX = "Скриншот или схема из раздела"   # картинка без описания: в контекст не годится
 
 CANDIDATES = 15          # сколько кандидатов берём из Qdrant перед пересортировкой
 LEXICAL_WEIGHT = 0.05    # максимальная добавка за совпадение слов; score для порога остаётся чистым
@@ -87,6 +96,55 @@ def _stem(word: str) -> str:
 
 def _words(text: str) -> set[str]:
     return {_stem(w) for w in _WORD_RE.findall(text.lower()) if len(w) > 3}
+
+
+# Служебные слова вопросов: совпадение по ним ничего не говорит о теме
+_STOP = {_stem(w) for w in (
+    "какой", "какая", "какие", "каком", "какого", "могут", "может", "можно", "нужно", "надо", "почему",
+    "когда", "где", "куда", "зачем", "есть", "быть", "будет", "этот", "этого", "этом", "если", "чтобы",
+    "который", "которая", "которые", "работает", "работать", "сделать", "делать", "опиши", "расскажи",
+    "скажи", "подскажи", "пожалуйста", "мне", "меня", "вообще", "там", "тут", "как", "что", "для",
+    # общие глаголы: «настроить», «изменить» есть в любом документе и о теме не говорят
+    "настроить", "изменить", "установить", "заменить", "заказать", "создать", "подключить", "выбрать",
+    "найти", "открыть", "перейти", "посмотреть", "получить", "отправить", "использовать", "оформить",
+    "восстановить", "рассчитать", "перенести", "прикрепить", "приготовить", "выглядит",
+)}
+
+
+def _key_words(query: str) -> set[str]:
+    return _words(query) - _STOP
+
+
+def overlap(query_words: set[str], hit: dict) -> tuple[int, float]:
+    """Сколько значимых слов вопроса встречается в разделе и тексте фрагмента."""
+    if not query_words:
+        return 0, 0.0
+
+    found = len(query_words & _words(f"{hit.get('section') or ''} {hit['text']}"))
+    return found, found / len(query_words)
+
+
+def accepts(hit: dict, query_words: set[str], threshold: float | None = None) -> bool:
+    """Годится ли фрагмент для ответа: выше порога, либо чуть ниже, но со словами вопроса."""
+    if threshold is None:
+        threshold = CONFIDENCE_THRESHOLD
+
+    if hit["text"].startswith(PLACEHOLDER_PREFIX):
+        return False
+
+    if hit["score"] >= threshold:
+        return True
+
+    if hit["score"] >= threshold - SOFT_MARGIN:
+        found, share = overlap(query_words, hit)
+        return found >= min(MIN_MATCHED_WORDS, len(query_words)) and share >= MIN_OVERLAP
+
+    return False
+
+
+def select_hits(hits: list[dict], query: str) -> list[dict]:
+    qwords = _key_words(query)
+    return [h for h in hits if accepts(h, qwords)][:CONTEXT_CHUNKS]
 
 
 def _lexical_bonus(query_words: set[str], text: str) -> float:
@@ -244,16 +302,19 @@ def _collect_images(best: dict, good: list[dict]) -> list[str]:
     return list(dict.fromkeys(paths))[:5]
 
 
+_ABBR = re.compile(r"(?<![а-яa-zё0-9])бо(?![а-яa-zё0-9])", re.IGNORECASE)
+
+
+def _expand_abbr(query: str) -> str:
+    """«БО» в вопросах сотрудников — это БАРС Офис: короткая аббревиатура плохо ищется по смыслу."""
+    return _ABBR.sub("БАРС Офис", query or "")
+
+
 def _search_qdrant_sync(query: str) -> tuple[str | None, dict | None]:
-    hits = search(query, top_k=TOP_K)
+    query = _expand_abbr(query)
+    hits = search(query, top_k=TOP_K + 3)
 
-    if not is_confident(hits):
-        return None, None
-
-    good = [
-        h for h in hits
-        if h["score"] >= CONFIDENCE_THRESHOLD
-    ][:CONTEXT_CHUNKS]
+    good = select_hits(hits, query)
 
     if not good:
         return None, None
@@ -280,7 +341,7 @@ def _search_qdrant_sync(query: str) -> tuple[str | None, dict | None]:
         "citation": format_source(best),
         "image_path": best["image_path"],
         "images": _collect_images(best, good),
-        "related": related_titles(hits, best, CONFIDENCE_THRESHOLD),
+        "related": related_titles(hits, best, CONFIDENCE_THRESHOLD - SOFT_MARGIN),
         "system": best["system"],
         "sources": list(dict.fromkeys(format_source(h) for h in good)),
     }

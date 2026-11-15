@@ -31,7 +31,8 @@ log = logging.getLogger("bot")
 
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPERATOR_CHAT_ID = os.getenv("OPERATOR_CHAT_ID")
-BASE_API_URL = os.getenv("API_URL", "http://app:8000").rstrip("/")
+# В .env часто пишут полный адрес с /webhook: убираем хвост, иначе запрос уйдёт на /webhook/webhook (404)
+BASE_API_URL = re.sub(r"/webhook$", "", os.getenv("API_URL", "http://app:8000").rstrip("/"))
 CORE_API_URL = f"{BASE_API_URL}/webhook"
 PROXY_URL = os.getenv("PROXY_URL") or None
 CORE_TIMEOUT = float(os.getenv("CORE_TIMEOUT", "180"))
@@ -201,7 +202,7 @@ async def answer_question(message: Message, user: User, text: str) -> None:
     local_history[user.id].append(f"Пользователь: {text}")
     typing_task = asyncio.create_task(keep_typing(message.chat.id))
     try:
-        r = await http.post(CORE_API_URL, json={"user_id": user.id, "text": text})
+        r = await http.post(CORE_API_URL, json={"user_id": user.id, "text": text},timeout=300.0)
         r.raise_for_status()
         data = r.json()
     except Exception:

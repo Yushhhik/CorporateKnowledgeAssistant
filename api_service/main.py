@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from llm_service import LLMError, ask_llm
-from prompts import NO_ANSWER
+from prompts import NO_ANSWER, furniture_note
 import time
 
 import features
@@ -157,13 +157,20 @@ async def receive_message(msg: TelegramMessage):
             if answer == NO_ANSWER:
                 suggest_operator = True
             else:
+                note = furniture_note(msg.text, context)
+                if note and "реестра техники нет" not in answer:
+                    answer = f"{note} Возможно, вы имели в виду реестр мебели?\n\n{answer}"
+
                 answer = f"{answer}\n\n" + "\n".join(payload["sources"])
                 images = _image_urls(payload)
                 related = payload.get("related") or []
                 source = payload.get("source")
 
         await save_to_history(msg.user_id, f"Пользователь: {msg.text}")
-        await save_to_history(msg.user_id, f"Бот: {answer}")
+
+        # Отказ в историю не кладём: увидев его, модель начинает отказывать и на нормальные вопросы
+        if not suggest_operator:
+            await save_to_history(msg.user_id, f"Бот: {answer}")
 
         response = {
             "reply": answer,
