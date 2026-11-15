@@ -42,7 +42,7 @@ OPERATOR_CHAT_ID = os.getenv("OPERATOR_CHAT_ID")
 BASE_API_URL = os.getenv("API_URL", "http://app:8000").rstrip("/").removesuffix("/webhook")
 CORE_API_URL = f"{BASE_API_URL}/webhook"
 PROXY_URL = os.getenv("PROXY_URL") or None
-CORE_TIMEOUT = float(os.getenv("CORE_TIMEOUT", "180"))
+CORE_TIMEOUT = float(os.getenv("CORE_TIMEOUT", "1300"))
 SLOW_NOTICE_DELAY = float(os.getenv("SLOW_NOTICE_DELAY", "8"))
 SYNC_INTERVAL = float(os.getenv("SYNC_INTERVAL", "300"))
 STATS_FILE = os.getenv("STATS_FILE", "/data/stats.json")
@@ -669,16 +669,22 @@ async def sync_loop() -> None:
 
 
 async def notify_admins(text: str, user_id: int, markup: InlineKeyboardMarkup | None = None) -> bool:
-    targets = [OPERATOR_CHAT_ID] if OPERATOR_CHAT_ID else sorted(ADMIN_IDS)
-    delivered = False
-    for target in targets:
-        try:
-            sent = await bot.send_message(target, text, reply_markup=markup)
-            remember_thread(sent.message_id, user_id)
-            delivered = True
-        except Exception:
-            log.exception("Не удалось отправить сообщение админам в %s", target)
-    return delivered
+    # Сначала чат операторов; если туда не доставилось (бот не в группе, группу переименовали в супергруппу,
+    # неверный ID), пишем лично администраторам. Админы должны хотя бы раз нажать /start у бота.
+    groups = [[OPERATOR_CHAT_ID]] if OPERATOR_CHAT_ID else []
+    groups.append(sorted(ADMIN_IDS))
+    for targets in groups:
+        delivered = False
+        for target in targets:
+            try:
+                sent = await bot.send_message(target, text, reply_markup=markup)
+                remember_thread(sent.message_id, user_id)
+                delivered = True
+            except Exception:
+                log.exception("Не удалось отправить сообщение админам в %s", target)
+        if delivered:
+            return True
+    return False
 
 
 async def fetch_documents() -> list[str]:

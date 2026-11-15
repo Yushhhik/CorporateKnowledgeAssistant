@@ -4,7 +4,7 @@
   - текст, разбитый на чанки ~450 символов с перекрытием, с привязкой к разделу;
   - таблицы (каждая строка превращается в "Колонка: значение; ...");
   - картинки (скриншоты, схемы): сохраняем в images/ и описываем текстом
-    через vision-модель OpenAI. Пока ключа нет, описание = заглушка из контекста.
+    через локальную vision-модель llava (Ollama). Если llava недоступна: OCR, иначе заглушка из контекста.
 
 Формат чанка:
   {"type": "text" | "image", "source": "файл", "section": "раздел или стр. N",
@@ -20,7 +20,7 @@
     («5 Инструкция», «2.1.1 Редактор фильтров»), чтобы в ответе бота был точный источник;
   - таблицы превращает в строки «Колонка: значение», а не в кашу из склеенных ячеек;
   - берёт даже узкие скриншоты (кнопки, панели инструментов);
-  - если нет ключа OpenAI, читает текст со скриншотов через tesseract (необязательно: нужен pytesseract + tesseract).
+  - если llava недоступна, читает текст со скриншотов через tesseract (необязательно: нужен pytesseract + tesseract).
 """
 import base64
 import hashlib
@@ -40,7 +40,7 @@ from PIL import Image
 
 # Версия логики парсера. Меняй при правках parser.py: ingest.py увидит новую версию
 # и сам пересчитает все файлы (без ручного --full).
-PARSER_VERSION = "4"
+PARSER_VERSION = "6"
 
 CHUNK_SIZE = 450
 CHUNK_OVERLAP = 80
@@ -50,7 +50,14 @@ MIN_IMAGE_MIN_SIDE = 12       # и совсем тонкие полоски то
 
 IMAGES_DIR = Path(os.getenv("IMAGES_DIR", "images"))
 CACHE_FILE = Path("image_descriptions.json")   # кеш описаний, чтобы не платить за одно и то же дважды
-VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o")
+# Описания картинок делает только локальная llava через Ollama, внешних сервисов и ключей нет
+VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llava")
+# INDEX_WITH_VISION=0: картинки документов при индексации читает tesseract (быстро), а не vision-модель.
+# На фото пользователей в чате это не влияет.
+INDEX_WITH_VISION = os.getenv("INDEX_WITH_VISION", "1") != "0"
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434").rstrip("/")
+VISION_TIMEOUT = float(os.getenv("VISION_TIMEOUT", "180"))
+VISION_MAX_SIDE = 1024        # большие скриншоты уменьшаем: llava на них не становится точнее, а считает дольше
 
 NOISE_RE = re.compile(r"Ошибка! Используйте вкладку.*?отображаться\.\s*–\s*\d+", re.S)
 PAGE_HEADER_RE = re.compile(r"(?m)^ЕИС\s*–.*$")
@@ -122,12 +129,38 @@ def _load_cache() -> dict:
     return {}
 
 
-def _describe_with_openai(img: Image.Image, section: str, context: str, doc: str = "") -> str | None:
-    try:
-        from openai import OpenAI
+_VISION_STATE: dict = {}
 
+
+def vision_available() -> bool:
+    """Отвечает ли Ollama и есть ли в ней модель llava. Проверяем один раз за запуск."""
+    if not INDEX_WITH_VISION:
+        return False
+
+    if "ok" not in _VISION_STATE:
+        try:
+            import urllib.request
+
+            with urllib.request.urlopen(f"{OLLAMA_BASE_URL}/api/tags", timeout=5) as resp:
+                names = [m.get("name", "") for m in json.loads(resp.read().decode("utf-8")).get("models", [])]
+            base = VISION_MODEL.split(":")[0]
+            _VISION_STATE["ok"] = any(n == VISION_MODEL or n.split(":")[0] == base for n in names)
+        except Exception:
+            _VISION_STATE["ok"] = False
+
+    return _VISION_STATE["ok"]
+
+
+def _describe_with_llava(img: Image.Image, section: str, context: str, doc: str = "") -> str | None:
+    """Описание картинки локальной llava через Ollama (/api/chat)."""
+    try:
+        import urllib.request
+
+        pic = img.convert("RGB")
+        if max(pic.size) > VISION_MAX_SIDE:
+            pic.thumbnail((VISION_MAX_SIDE, VISION_MAX_SIDE))
         buf = BytesIO()
-        img.save(buf, "PNG")
+        pic.save(buf, "PNG")
         b64 = base64.b64encode(buf.getvalue()).decode()
         prompt = (
             f"Это изображение из документации корпоративной системы. Документ: {doc}. Раздел: {section}. "
@@ -137,17 +170,20 @@ def _describe_with_openai(img: Image.Image, section: str, context: str, doc: str
             "всё расположено. Если это схема бизнес-процесса: по порядку перечисли шаги, роли, "
             "условия и переходы между ними. Без вступлений, не длиннее 1200 символов."
         )
-        resp = OpenAI().chat.completions.create(
-            model=VISION_MODEL,
-            messages=[{"role": "user", "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-            ]}],
-            max_tokens=700,
-        )
-        return resp.choices[0].message.content.strip()
+        body = json.dumps({
+            "model": VISION_MODEL,
+            "messages": [{"role": "user", "content": prompt, "images": [b64]}],
+            "stream": False,
+            "options": {"temperature": 0.1, "num_predict": 500},
+        }).encode("utf-8")
+        req = urllib.request.Request(f"{OLLAMA_BASE_URL}/api/chat", data=body,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=VISION_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        text = (data.get("message", {}).get("content") or "").strip()
+        return text or None
     except Exception as e:
-        print(f"  [vision] не удалось описать картинку: {e}")
+        print(f"  [vision] llava не смогла описать картинку: {e}")
         return None
 
 
@@ -211,10 +247,10 @@ def _ocr_image(img: Image.Image) -> str:
 def make_image_chunk(img_bytes: bytes, source: str, stem: str, section: str, context: str,
                      seen: set, page=None, skip_if_few_colors: bool = False,
                      native_size: tuple | None = None) -> dict | None:
-    """Картинка -> чанк с описанием. Описание: vision-модель OpenAI, иначе OCR, иначе заглушка.
+    """Картинка -> чанк с описанием. Описание: локальная llava, иначе OCR, иначе заглушка.
 
     described=True только если описание получено от vision-модели (ingest.py повторит
-    попытку для остальных, когда ключ заработает). method: vision | ocr | placeholder.
+    попытку для остальных, когда llava станет доступна). method: vision | ocr | placeholder.
     """
     key = hashlib.md5(img_bytes).hexdigest()
     if key in seen:
@@ -246,8 +282,8 @@ def make_image_chunk(img_bytes: bytes, source: str, stem: str, section: str, con
     cache_key = f"{VISION_MODEL}:{key}"       # у другой модели будет своё описание
     desc = cache.get(cache_key)
     method = "vision" if desc else None
-    if not desc and os.getenv("OPENAI_API_KEY"):
-        desc = _describe_with_openai(img, section, context, stem)
+    if not desc and vision_available():
+        desc = _describe_with_llava(img, section, context, stem)
         if desc:
             cache[cache_key] = desc
             CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")

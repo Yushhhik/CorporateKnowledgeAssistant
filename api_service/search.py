@@ -33,6 +33,17 @@ PLACEHOLDER_PREFIX = "Скриншот или схема из раздела"
 CANDIDATES = 15
 LEXICAL_WEIGHT = 0.05
 MAX_CONTEXT_CHARS = 3500
+MAX_IMAGES = 2
+
+# Картинки из документации показываем, только когда человек просит что-то увидеть
+VISUAL_RE = re.compile(
+    r"выгляд|скриншот|скрин|картинк|изображен|схем|диаграмм|покажи|показать|иконк|интерфейс|кнопк|экран|где наход|где найти",
+    re.IGNORECASE,
+)
+
+
+def wants_visual(query: str) -> bool:
+    return bool(VISUAL_RE.search(query or ""))
 
 _client = None
 
@@ -107,6 +118,10 @@ def accepts(hit: dict, query_words: set[str], threshold: float | None = None) ->
         threshold = CONFIDENCE_THRESHOLD
     if hit["text"].startswith(PLACEHOLDER_PREFIX):
         return False
+    if hit.get("type") == "image":
+        # Описания картинок от vision-модели неточные: берём только при высоком score и совпадении слов вопроса
+        found, _ = overlap(query_words, hit)
+        return hit["score"] >= threshold and found >= 1
     if hit["score"] >= threshold:
         return True
     if hit["score"] >= threshold - SOFT_MARGIN:
@@ -223,16 +238,17 @@ def _expand(best: dict) -> str:
     return "\n".join(parts)
 
 
-def _collect_images(best: dict, good: list[dict]) -> list[str]:
-    paths = [h["image_path"] for h in good if h.get("image_path")]
-    if best.get("page") is not None:
+def _collect_images(best: dict, image_hits: list[dict], visual: bool) -> list[str]:
+    """Только релевантные картинки: сама найденная картинка и, если просят показать, картинки того же раздела."""
+    paths = [h["image_path"] for h in image_hits if h.get("image_path")]
+    if visual and best.get("page") is not None:
         try:
             for p in get_page_images(_get_client(), best["source"], best["page"]):
-                if p.get("image_path"):
+                if p.get("image_path") and p.get("section") == best.get("section"):
                     paths.append(p["image_path"])
         except Exception:
             log.exception("page images failed")
-    return list(dict.fromkeys(paths))[:5]
+    return list(dict.fromkeys(paths))[:MAX_IMAGES]
 
 
 _ABBR = re.compile(r"(?<![а-яa-zё0-9])бо(?![а-яa-zё0-9])", re.IGNORECASE)
@@ -248,24 +264,30 @@ def _search_qdrant_sync(query: str) -> tuple[str | None, dict | None]:
     good = select_hits(hits, query)
     if not good:
         return None, None
-    best = good[0]
+    visual = wants_visual(query)
+    text_hits = [h for h in good if h["type"] != "image"]
+    image_hits = [h for h in good if h["type"] == "image"]
+    # Описания картинок в текст для LLM берём, только если спрашивают про внешний вид (или другого текста нет)
+    used = good if (visual or not text_hits) else text_hits
+    best = used[0]
     blocks = []
-    for i, h in enumerate(good):
+    for i, h in enumerate(used):
         text = _expand(h) if i == 0 else h["text"]
         blocks.append(f"[{format_source(h)}]\n{text}")
     context = "\n\n".join(blocks)[:MAX_CONTEXT_CHARS]
 
+    images = _collect_images(best, image_hits, visual)
     payload = {
         "source": best["source"],
         "page": (best["page"] if best["page"] is not None else best["section"]),
         "score": best["score"],
         "section": best["section"],
         "citation": format_source(best),
-        "image_path": best["image_path"],
-        "images": _collect_images(best, good),
+        "image_path": images[0] if images else None,
+        "images": images,
         "related": related_titles(hits, best, CONFIDENCE_THRESHOLD - SOFT_MARGIN),
         "system": best["system"],
-        "sources": list(dict.fromkeys(format_source(h) for h in good)),
+        "sources": list(dict.fromkeys(format_source(h) for h in used)),
     }
     return context, payload
 

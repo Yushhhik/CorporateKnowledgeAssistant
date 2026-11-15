@@ -12,3 +12,4 @@ qdrant_data/
 images/
 docs/
 Modelfile
+api_service/wheels/

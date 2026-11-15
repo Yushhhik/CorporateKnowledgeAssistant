@@ -60,6 +60,8 @@ services:
       - QDRANT_HOST=qdrant
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
       - OLLAMA_MODEL=${OLLAMA_MODEL}
+      - OLLAMA_VISION_MODEL=${OLLAMA_VISION_MODEL:-qwen2.5vl:3b}
+      - INDEX_WITH_VISION=${INDEX_WITH_VISION:-0}
       - DATABASE_URL=${DATABASE_URL}
     volumes:
       - ./hf_cache:/app/hf_cache

@@ -5,12 +5,15 @@ import sys
 from pathlib import Path
 
 from parser import (
+    INDEX_WITH_VISION,
     CHUNK_OVERLAP,
     CHUNK_SIZE,
     PARSER_VERSION,
     VISION_MODEL,
+    _ocr_langs,
     list_document_files,
     parse_file,
+    vision_available,
 )
 from qdrant_store import (
     COLLECTION_NAME,
@@ -35,7 +38,8 @@ SYSTEMS = {
 
 FINGERPRINT = (
     f"{EMBEDDING_MODEL}|chunk={CHUNK_SIZE}|"
-    f"overlap={CHUNK_OVERLAP}|parser={PARSER_VERSION}|vision={VISION_MODEL}|"
+    f"overlap={CHUNK_OVERLAP}|parser={PARSER_VERSION}|"
+    f"vision={VISION_MODEL if INDEX_WITH_VISION else 'ocr'}|"
     f"systems={json.dumps(SYSTEMS, sort_keys=True, ensure_ascii=False)}"
 )
 
@@ -109,10 +113,17 @@ def main(folder: str = "docs", full: bool = False) -> None:
     client = get_client()
     cache = load_cache()
 
-    vision = bool(os.getenv("OPENAI_API_KEY"))
+    vision = vision_available()
 
-    if not vision:
-        print("OPENAI_API_KEY не задан: картинки получат заглушки")
+    if not INDEX_WITH_VISION:
+        langs = _ocr_langs()
+        print(f"Режим OCR (INDEX_WITH_VISION=0): картинки читает tesseract, языки: {langs or 'НЕТ'}")
+        if not langs:
+            print("ВНИМАНИЕ: tesseract не найден или нет языка rus: картинки получат заглушки. "
+                  "Установите tesseract-ocr и tesseract-ocr-rus в образ")
+    elif not vision:
+        print(f"Vision-модель ({VISION_MODEL}) в Ollama недоступна: картинки получат OCR или заглушки. "
+              f"Выполните `ollama pull {VISION_MODEL}` и запустите ingest ещё раз")
 
     if full or not client.collection_exists(COLLECTION_NAME):
         if full:

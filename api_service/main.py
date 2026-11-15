@@ -42,7 +42,6 @@ app.mount("/images", StaticFiles(directory=str(IMAGES_DIR)), name="images")
 
 DOCS_DIR = Path("/app/docs")
 DOCS_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/docs", StaticFiles(directory=str(DOCS_DIR)), name="docs")
 
 
 class TelegramMessage(BaseModel):
@@ -115,7 +114,7 @@ async def history_endpoint(user_id: int):
     return {"history": "\n".join(reversed(items))}
 
 
-def _image_urls(payload: dict, limit: int = 4) -> list[str]:
+def _image_urls(payload: dict, limit: int = 2) -> list[str]:
     urls = []
     for path in [payload.get("image_path"), *(payload.get("images") or [])]:
         if path and (IMAGES_DIR / Path(path).name).is_file():
@@ -216,7 +215,11 @@ async def receive_message(msg: TelegramMessage, db: AsyncSession = Depends(get_d
     if not msg.text and not msg.image_base64:
         return {"status": "error", "reply": "Сообщение пустое"}
 
-    if not msg.text and msg.image_base64:
+    # Фото без подписи: искать в базе знаний нечего (служебная фраза в документах не встречается),
+    # поэтому поиск пропускаем и сразу отдаём картинку llava
+    image_only = bool(msg.image_base64) and not (msg.text or "").strip()
+
+    if image_only:
         msg.text = "Опиши это изображение"
 
     log.info("Сообщение от %s: %s", msg.user_id, msg.text)
@@ -243,41 +246,40 @@ async def receive_message(msg: TelegramMessage, db: AsyncSession = Depends(get_d
             await features.track(r, "cached", time.monotonic() - started, source=cached.get("source"))
             return {"status": "success", "cached": True, **{k: v for k, v in cached.items() if k != "source"}}
 
-        context, payload = await search_qdrant(search_query, raise_errors=True)
+        if image_only:
+            context, payload = None, None
+        else:
+            context, payload = await search_qdrant(search_query, raise_errors=True)
 
         suggest_operator = False
         images: list[str] = []
         related: list[str] = []
         source = None
 
-        if context is None:
+        if context is None and not msg.image_base64:
             answer = NO_ANSWER
             suggest_operator = True
         else:
-            answer = await ask_llm(context, history, msg.text, image_base64=msg.image_base64)
+            answer = await ask_llm(context if context else "", history, msg.text, image_base64=msg.image_base64)
 
             if answer == NO_ANSWER:
                 suggest_operator = True
             else:
-                note = furniture_note(msg.text, context)
+                note = None if msg.image_base64 else furniture_note(msg.text, context or "")
                 if note and "реестра техники нет" not in answer:
                     answer = f"{note} Возможно, вы имели в виду реестр мебели?\n\n{answer}"
 
-                public_url = os.getenv("PUBLIC_API_URL", "http://127.0.0.1:8000").rstrip("/")
                 if payload and payload.get("sources"):
-                    sources = [
-                        s.replace("](/docs/", f"]({public_url}/docs/")
-                        for s in payload["sources"]
-                    ]
-                    answer = f"{answer}\n\n" + "\n".join(sources)
+                    answer = f"{answer}\n\n" + "\n".join(payload["sources"])
                 if payload:
-                    images = _image_urls(payload)
+                    # на фото пользователя картинки из документации не прикладываем
+                    images = [] if msg.image_base64 else _image_urls(payload)
                     related = payload.get("related") or []
                     source = payload.get("source")
 
-        await save_to_history(msg.user_id, f"Пользователь: {msg.text}")
-
-        if not suggest_operator:
+        # обмен про фото в историю не пишем: он мешает следующим текстовым вопросам
+        if not msg.image_base64:
+            await save_to_history(msg.user_id, f"Пользователь: {msg.text}")
             await save_to_history(msg.user_id, f"Бот: {answer}")
 
         response = {
