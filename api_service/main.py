@@ -33,7 +33,9 @@ SERVICE_ERROR = "Извините, сервис временно недосту�
 IMAGES_DIR = Path(os.getenv("IMAGES_DIR", "images"))
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/images", StaticFiles(directory=str(IMAGES_DIR)), name="images")
-
+DOCS_DIR = Path("docs")
+if DOCS_DIR.exists():
+    app.mount("/docs", StaticFiles(directory=str(DOCS_DIR)), name="docs")
 
 class TelegramMessage(BaseModel):
     user_id: int
@@ -157,7 +159,8 @@ async def receive_message(msg: TelegramMessage):
             if answer == NO_ANSWER:
                 suggest_operator = True
             else:
-                answer = f"{answer}\n\n" + "\n".join(payload["sources"])
+                sources_md = "\n".join(f"📎 {s}" for s in payload["sources"])
+                answer = f"{answer}\n\n{sources_md}"
                 images = _image_urls(payload)
                 related = payload.get("related") or []
                 source = payload.get("source")
@@ -167,6 +170,7 @@ async def receive_message(msg: TelegramMessage):
 
         response = {
             "reply": answer,
+            "parse_mode": "Markdown",
             "suggest_operator": suggest_operator,
             "image_path": images[0] if images else None,
             "images": images,

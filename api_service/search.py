@@ -190,14 +190,11 @@ def is_confident(
 
 
 def format_source(hit: dict) -> str:
-    """Формирует ссылку на источник."""
-
     name = Path(hit["source"]).stem
-
+    filename = hit["source"]
     if hit.get("page"):
-        return f"Источник: {name}, стр. {hit['page']}"
-
-    return f"Источник: {name}, раздел «{hit.get('section')}»"
+        return f"[{name}, стр. {hit['page']}](/docs/{filename}#page={hit['page']})"
+    return f"[{name}](/docs/{filename})"
 
 
 def _expand(best: dict) -> str:

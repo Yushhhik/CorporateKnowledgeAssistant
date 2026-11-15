@@ -25,7 +25,7 @@ __CONTEXT__"""
 
 
 def build_prompt(context: str, history: List[str], question: str) -> List[Dict]:
-    if not context or context.strip() == "":
+    if not context or not context.strip():
         system_content = (
             "Ты — корпоративный ассистент БАРС Груп. "
             "Контекст пустой, поэтому на любой вопрос отвечай дословно: "

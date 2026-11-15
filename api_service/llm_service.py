@@ -1,7 +1,6 @@
 import asyncio
 import os
 import re
-
 import openai
 
 from prompts import NO_ANSWER, build_prompt
