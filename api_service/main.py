@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-import shutil
+import threading
 from pathlib import Path
 
 import redis.asyncio as redis
@@ -19,6 +19,7 @@ import time
 import features
 from search import search_qdrant, warm
 from database import get_db, init_db, User
+from files_server import router as files_router
 from ingest import main as run_ingest
 
 log = logging.getLogger("rag.api")
@@ -41,8 +42,14 @@ IMAGES_DIR = Path(os.getenv("IMAGES_DIR", "images"))
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/images", StaticFiles(directory=str(IMAGES_DIR)), name="images")
 
-DOCS_DIR = Path("/app/docs")
+DOCS_DIR = Path(os.getenv("DOCS_DIR", "/app/docs"))
 DOCS_DIR.mkdir(parents=True, exist_ok=True)
+DOC_EXTENSIONS = (".pdf", ".docx")
+DOC_MAX_SIZE = 20 * 1024 * 1024
+app.include_router(files_router)          # /files/<имя>?sig=...: подписанные ссылки на источники
+
+_ingest_lock = threading.Lock()
+_ingest_again = threading.Event()
 
 
 class TelegramMessage(BaseModel):
@@ -69,6 +76,13 @@ class UserCreate(BaseModel):
     telegram_id: int
     admin_id: int
     full_name: str = "Сотрудник"
+
+
+def _is_admin(user: User) -> bool:
+    """Флаг админа из БД: поддерживаем столбцы is_admin / admin / role = 'admin'."""
+    if getattr(user, "is_admin", None) or getattr(user, "admin", None):
+        return True
+    return str(getattr(user, "role", "") or "").lower() == "admin"
 
 
 async def _warm_up():
@@ -115,6 +129,17 @@ async def history_endpoint(user_id: int):
     return {"history": "\n".join(reversed(items))}
 
 
+@app.post("/reset/{user_id}")
+async def reset_dialog(user_id: int):
+    """Новая тема: забываем историю, тему и найденные фрагменты, чтобы короткие вопросы не липли к старой теме."""
+    try:
+        await r.delete(f"chat:{user_id}", f"topic:{user_id}", f"lastctx:{user_id}")
+    except Exception as e:
+        log.warning("Redis недоступен, диалог не сброшен: %s", e)
+        return {"status": "error"}
+    return {"status": "success"}
+
+
 def _image_urls(payload: dict, limit: int = 4) -> list[str]:
     urls = []
     for path in [payload.get("image_path"), *(payload.get("images") or [])]:
@@ -150,7 +175,7 @@ async def auth_endpoint(auth: AuthRequest, db: AsyncSession = Depends(get_db)):
     user.telegram_id = auth.telegram_id
     user.is_verified = True
     await db.commit()
-    return {"status": "success", "full_name": user.full_name}
+    return {"status": "success", "full_name": user.full_name, "is_admin": _is_admin(user)}
 
 
 @app.post("/users")
@@ -181,34 +206,97 @@ async def get_all_users(db: AsyncSession = Depends(get_db)):
 
     return {
         "users": [
-            {"telegram_id": u.telegram_id, "employee_id": u.employee_id}
+            {"telegram_id": u.telegram_id, "employee_id": u.employee_id, "is_admin": _is_admin(u)}
             for u in users
         ]
     }
 
 
+@app.get("/users/by_telegram/{telegram_id}")
+async def get_user_by_telegram(telegram_id: int, db: AsyncSession = Depends(get_db)):
+    """Есть ли сотрудник с таким Telegram ID в БД. Если есть, бот пускает его без авторизации.
+
+    Запись, внесённая в БД заранее, считается подтверждённой: помечаем её is_verified,
+    иначе /webhook отвечал бы «unauthorized» уже пропущенному пользователю.
+    """
+    result = await db.execute(select(User).where(User.telegram_id == telegram_id))
+    user = result.scalars().first()
+
+    if not user:
+        return JSONResponse(status_code=404, content={"status": "not_found"})
+
+    if not user.is_verified:
+        user.is_verified = True
+        await db.commit()
+
+    return {
+        "status": "success",
+        "telegram_id": user.telegram_id,
+        "employee_id": user.employee_id,
+        "full_name": user.full_name,
+        "is_admin": _is_admin(user),
+    }
+
+
+def _run_ingest_background() -> None:
+    """Индексация новых документов в фоне. Одновременно идёт один запуск; если за это время
+    загрузили ещё файл, после окончания запускаем ещё раз."""
+    if not _ingest_lock.acquire(blocking=False):
+        _ingest_again.set()
+        return
+
+    try:
+        while True:
+            _ingest_again.clear()
+            try:
+                log.info("Индексация документов запущена")
+                run_ingest(str(DOCS_DIR), full=False)
+                log.info("Индексация документов завершена")
+            except Exception:
+                log.exception("Ошибка индексации документов")
+            if not _ingest_again.is_set():
+                break
+    finally:
+        _ingest_lock.release()
+
+
 @app.get("/documents")
 async def get_documents():
-    files = [f.name for f in DOCS_DIR.glob("*") if f.suffix.lower() in (".pdf", ".docx")]
+    files = sorted(f.name for f in DOCS_DIR.glob("*") if f.suffix.lower() in DOC_EXTENSIONS)
     return {"documents": files}
 
 
 @app.post("/documents")
 async def upload_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    file_path = DOCS_DIR / file.filename
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    """Принимает PDF/DOCX (multipart), кладёт в папку docs и запускает индексацию в фоне."""
+    name = Path(file.filename or "").name          # без путей вида ../../x
 
-    background_tasks.add_task(run_ingest, str(DOCS_DIR), full=False)
+    if not name or not name.lower().endswith(DOC_EXTENSIONS):
+        raise HTTPException(status_code=400, detail="Поддерживаются только файлы PDF и DOCX")
 
-    return {"status": "success", "filename": file.filename}
+    target = DOCS_DIR / name
+    tmp = DOCS_DIR / f".{name}.part"
+    size = 0
 
+    try:
+        with open(tmp, "wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > DOC_MAX_SIZE:
+                    raise HTTPException(status_code=413, detail="Файл больше 20 МБ")
+                out.write(chunk)
 
-def _image_url(payload: dict) -> str | None:
-    for path in [payload.get("image_path"), *(payload.get("images") or [])]:
-        if path and (IMAGES_DIR / Path(path).name).is_file():
-            return f"/images/{Path(path).name}"
-    return None
+        if size == 0:
+            raise HTTPException(status_code=400, detail="Файл пустой")
+
+        tmp.replace(target)                         # файл появляется целиком, без полузаписанных
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    background_tasks.add_task(_run_ingest_background)
+    log.info("Документ %s принят (%s байт), индексация поставлена в очередь", name, size)
+
+    return {"status": "success", "filename": name, "size": size}
 
 
 @app.post("/webhook")

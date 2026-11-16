@@ -15,9 +15,8 @@ log = logging.getLogger("rag.llm")
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llava")
-# Картинки всегда разбирает llava, текстовые вопросы — OLLAMA_MODEL
 VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "llava")
-LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "120"))
+LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "500"))
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "700"))
 
 _client: openai.OpenAI | None = None

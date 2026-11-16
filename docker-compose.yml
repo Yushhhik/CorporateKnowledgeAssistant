@@ -60,8 +60,10 @@ services:
       - QDRANT_HOST=qdrant
       - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
       - OLLAMA_MODEL=${OLLAMA_MODEL}
-      - OLLAMA_VISION_MODEL=${OLLAMA_VISION_MODEL:-qwen2.5vl:3b}
-      - INDEX_WITH_VISION=${INDEX_WITH_VISION:-0}
+      - OLLAMA_VISION_MODEL=${OLLAMA_VISION_MODEL:-llava}
+      - PUBLIC_FILES_URL=${PUBLIC_FILES_URL:-}
+      - PUBLIC_API_URL=${PUBLIC_API_URL:-}
+      - FILES_SECRET=${FILES_SECRET:-}
       - DATABASE_URL=${DATABASE_URL}
     volumes:
       - ./hf_cache:/app/hf_cache
@@ -75,6 +77,23 @@ services:
       timeout: 10s
       retries: 10
       start_period: 120s
+
+  files:
+    build: ./api_service
+    command: ["uvicorn", "files_server:app", "--host", "0.0.0.0", "--port", "8001"]
+    ports:
+      - "8001:8001"
+    environment:
+      - DOCS_DIR=/app/docs
+      - FILES_SECRET=${FILES_SECRET:-}
+      - DATABASE_URL=${DATABASE_URL}
+    volumes:
+      - ./docs:/app/docs:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
 
   bot:
     build: ./bot_service
